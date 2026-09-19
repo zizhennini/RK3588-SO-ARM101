@@ -88,6 +88,11 @@ def make_layernorm_onnx(path: Path) -> None:
 
 def convert(onnx_path: Path, rknn_path: Path) -> tuple[bool, str]:
     """返回 (是否成功, 日志)。"""
+    # ⚠️ 必须在 import rknn 之前打垫片（onnx>=1.17 移除了 onnx.mapping）
+    from rknn_onnx_compat import patch_onnx_mapping
+
+    patch_onnx_mapping()
+
     from rknn.api import RKNN
 
     buf = io.StringIO()
@@ -143,15 +148,25 @@ def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     print(f"rknn-toolkit2 冒烟测试  输出目录: {OUT_DIR}")
 
+    # 让 `import rknn_onnx_compat` 在直接运行本文件时也能找到
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+    from rknn_onnx_compat import patch_onnx_mapping
+
+    added = patch_onnx_mapping(verbose=True)
+    print(f"onnx.mapping 垫片: {'已注入' if added else '无需'}")
+
     try:
-        import rknn
-        print(f"rknn-toolkit2 版本: {getattr(rknn, '__version__', '?')}")
+        from rknn.api import RKNN  # noqa: F401
+
+        print("rknn-toolkit2: 可导入")
     except Exception as e:  # noqa: BLE001
         print(f"rknn 导入失败: {e}")
         return 2
 
     import onnx
     import onnxruntime  # noqa: F401
+
     print(f"onnx {onnx.__version__}   numpy {np.__version__}")
 
     ok_all = True
@@ -166,13 +181,13 @@ def main() -> int:
     ok2, log2 = convert(p2, OUT_DIR / "layernorm.rknn")
     report("LayerNormalization（transformer 关键算子）", ok2, log2, OUT_DIR / "layernorm.rknn")
 
-    # 与 ONNX Runtime 对比数值（RKNN 无板卡时不能跑推理，只能比对 ORT 自身）
+    # RKNN 无板卡时不能跑推理；这里只确认 ONNX 本身可用作参考
     import onnxruntime as ort
+
     sess = ort.InferenceSession(str(p1), providers=["CPUExecutionProvider"])
     x = np.random.default_rng(2).normal(0, 1, (1, 64)).astype(np.float32)
-    tx = sess.get_io_binding  # noqa: F841  (占位，避免未使用告警)
     y = sess.run(None, {"x": x})[0]
-    print(f"\nORT 参考输出: shape={y.shape} finite={np.isfinite(y).all()}")
+    print(f"\nORT 参考输出: shape={y.shape} finite={bool(np.isfinite(y).all())}")
 
     print("\n=== 结论 ===")
     if ok_all:

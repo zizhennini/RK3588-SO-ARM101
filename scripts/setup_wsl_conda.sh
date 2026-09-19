@@ -229,7 +229,7 @@ if [ -x "$CONDA" ]; then
 
   RKPY="$MINI/envs/rknn/bin/python"
   if [ -x "$RKPY" ]; then
-    "$RKPY" -m pip install -q -U pip wheel setuptools >/dev/null 2>&1
+    "$RKPY" -m pip install -q -U pip wheel >/dev/null 2>&1
     echo "  安装 rknn-toolkit2==2.3.2 与 onnx 工具链……"
     # rknn-toolkit2 要求 torch<=2.4.0 / numpy<=1.26.4
     if run_show "pip install rknn 工具链" "$RKPY" -m pip install \
@@ -238,6 +238,14 @@ if [ -x "$CONDA" ]; then
       ok "rknn 工具链已安装"
     else
       fail "rknn 工具链安装失败"
+    fi
+
+    # rknn-toolkit2 内部 import pkg_resources，而 setuptools>=81 已将其移除
+    echo "  钉住 setuptools<81（rknn-toolkit2 需要 pkg_resources）……"
+    if run_show "pip install setuptools<81" "$RKPY" -m pip install "setuptools<81"; then
+      ok "setuptools<81 已安装"
+    else
+      fail "setuptools<81 安装失败"
     fi
     "$RKPY" - <<'PY' || true
 import importlib

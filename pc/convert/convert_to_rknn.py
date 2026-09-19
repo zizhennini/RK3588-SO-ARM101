@@ -166,6 +166,13 @@ def main() -> int:
         return 2
 
     # ---------- 4. 转 RKNN ----------
+    # ⚠️ 必须在 import rknn 之前打垫片：
+    #    onnx>=1.17 移除了 onnx.mapping，而 rknn-toolkit2 2.3.2 内部依赖它
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from rknn_onnx_compat import patch_onnx_mapping
+
+    patch_onnx_mapping(verbose=True)
+
     from rknn.api import RKNN
 
     rknn = RKNN(verbose=False)
