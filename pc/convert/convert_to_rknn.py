@@ -143,6 +143,17 @@ def _try_build(onnx_path: str, out_path: Path, disable_rules: list[str] | None =
                 return None, buf.getvalue() + "\n[build 失败]"
             if rknn.export_rknn(str(out_path)) != 0:
                 return None, buf.getvalue() + "\n[export_rknn 失败]"
+            # 输入顺序确认需要真的跑一次推理。
+            # PC 上没有 NPU，rknn-toolkit2 会用**模拟器**（慢但可用）；
+            # 板端则是真实 NPU。模拟器的重排行为未必与真机完全一致，
+            # 所以板端还应再复核一次（见 rk3588/verify_input_order.py）。
+            if rknn.init_runtime() != 0:
+                return None, (
+                    buf.getvalue()
+                    + "\n[init_runtime 失败] PC 上需要模拟器、板端需要 NPU。"
+                    "\n若确实无法初始化 runtime，用 --skip-order-check 只导出模型，"
+                    "但那样**不能**生成 manifest（板端会拒绝运行）。"
+                )
         return rknn, buf.getvalue()
     except Exception as e:  # noqa: BLE001
         # ⚠️ rknn.build() 在融合规则出错时是**抛异常**，不是返回非零。
@@ -204,6 +215,11 @@ def main() -> int:
     ap.add_argument("--out", required=True, help="输出的 .rknn 路径")
     ap.add_argument("--tol", type=float, default=DEFAULT_TOL)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--skip-order-check",
+        action="store_true",
+        help="只导出 .rknn，跳过输入顺序确认（不生成 manifest，板端会拒绝运行）",
+    )
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)-7s %(message)s")
@@ -294,6 +310,16 @@ def main() -> int:
     log.info("已导出 %s (%.1f MB)", out_path, out_path.stat().st_size / 1e6)
 
     # ---------- 5. 暴力确认输入顺序 ----------
+    if args.skip_order_check:
+        log.warning("=" * 70)
+        log.warning("已跳过输入顺序确认（--skip-order-check）。")
+        log.warning("**未生成 manifest** —— 板端 act_rknn.py 会拒绝运行，这是刻意的。")
+        log.warning("导出物: %s", out_path)
+        log.warning("请在板端跑 rk3588/verify_input_order.py 完成确认后再生效。")
+        log.warning("=" * 70)
+        rknn.release()
+        return 0
+
     log.info("开始确认输入顺序（枚举 %d! = %d 种图像排列）……",
              len(image_idx), len(list(itertools.permutations(image_idx))))
 
