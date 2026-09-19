@@ -123,32 +123,62 @@ def _try_build(onnx_path: str, out_path: Path, disable_rules: list[str] | None =
 
     buf = io.StringIO()
     rknn = RKNN(verbose=False)
-    with redirect_stdout(buf), redirect_stderr(buf):
-        kwargs = dict(
-            target_platform="rk3588",
-            float_dtype="float16",
-            optimization_level=3,
-            single_core_mode=False,
-        )
-        if disable_rules:
-            kwargs["disable_rules"] = disable_rules
-            log.info("禁用图融合规则: %s", disable_rules)
-        if rknn.config(**kwargs) != 0:
-            return None, buf.getvalue() + "\n[rknn.config 失败]"
-        if rknn.load_onnx(model=onnx_path) != 0:
-            return None, buf.getvalue() + "\n[load_onnx 失败]"
-        # 故意不传 dataset —— do_quantization=False（transformer 图走 fp16）
-        if rknn.build(do_quantization=False) != 0:
-            return None, buf.getvalue() + "\n[build 失败]"
-        if rknn.export_rknn(str(out_path)) != 0:
-            return None, buf.getvalue() + "\n[export_rknn 失败]"
-    return rknn, buf.getvalue()
+    try:
+        with redirect_stdout(buf), redirect_stderr(buf):
+            kwargs = dict(
+                target_platform="rk3588",
+                float_dtype="float16",
+                optimization_level=3,
+                single_core_mode=False,
+            )
+            if disable_rules:
+                kwargs["disable_rules"] = disable_rules
+                log.info("禁用图融合规则: %s", disable_rules)
+            if rknn.config(**kwargs) != 0:
+                return None, buf.getvalue() + "\n[rknn.config 失败]"
+            if rknn.load_onnx(model=onnx_path) != 0:
+                return None, buf.getvalue() + "\n[load_onnx 失败]"
+            # 故意不传 dataset —— do_quantization=False（transformer 图走 fp16）
+            if rknn.build(do_quantization=False) != 0:
+                return None, buf.getvalue() + "\n[build 失败]"
+            if rknn.export_rknn(str(out_path)) != 0:
+                return None, buf.getvalue() + "\n[export_rknn 失败]"
+        return rknn, buf.getvalue()
+    except Exception as e:  # noqa: BLE001
+        # ⚠️ rknn.build() 在融合规则出错时是**抛异常**，不是返回非零。
+        #    只判断返回码会漏掉这类失败，回退逻辑就不会触发。
+        try:
+            rknn.release()
+        except Exception:  # noqa: BLE001
+            pass
+        return None, buf.getvalue() + f"\n[异常] {type(e).__name__}: {e}"
+
+
+# 已知有缺陷的图融合规则：日志里出现这些签名就禁用它们重试。
+# convert_layernorm_to_exnorm 在标准 LayerNormalization 节点上会抛
+# KeyError: 'LayerNormalization'（rknn-toolkit2 2.3.2，已实测复现）。
+KNOWN_BAD_RULES: dict[str, tuple[str, ...]] = {
+    "convert_layernorm_to_exnorm": (
+        "convert_layernorm_to_exnorm",
+        "_p_convert_layernorm_to_exnorm",
+    ),
+}
 
 
 def _find_failing_rule(log_text: str) -> str | None:
-    """从 rknn 日志里提取它建议禁用的融合规则名。"""
+    """找出该禁用的图融合规则名。
+
+    优先用工具自己在日志里给的建议（`disable_rules=['xxx']`）；
+    工具的提示行走的是它自己的 logger，可能没被 redirect 捕获，
+    所以再按已知签名兜底。
+    """
     m = re.search(r"disable_rules=\['([^']+)'\]", log_text)
-    return m.group(1) if m else None
+    if m:
+        return m.group(1)
+    for rule, markers in KNOWN_BAD_RULES.items():
+        if all(mk in log_text for mk in markers):
+            return rule
+    return None
 
 
 def _diagnose_build_failure(log_text: str) -> None:
