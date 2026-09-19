@@ -39,6 +39,7 @@ import itertools
 import json
 import logging
 import platform
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -97,6 +98,74 @@ def _ort_run(onnx_path: str, feeds: dict[str, np.ndarray]) -> np.ndarray:
 def _rknn_run(rknn, feeds_ordered: list[np.ndarray]) -> np.ndarray:
     outs = rknn.inference(inputs=feeds_ordered)
     return np.asarray(outs[0], dtype=np.float32)
+
+
+def _try_build(onnx_path: str, out_path: Path, disable_rules: list[str] | None = None):
+    """跑一次 config + load_onnx + build + export_rknn。
+
+    返回 (rknn 对象 或 None, 日志文本)。
+
+    之所以要吞日志：rknn-toolkit2 的图融合规则出错时会在日志里给出
+    `You can add disable_rules=['xxx'] in rknn.config()`，
+    我们要把它解析出来自动重试。
+    """
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+
+    # ⚠️ 必须在 import rknn 之前打垫片：
+    #    onnx>=1.17 移除了 onnx.mapping，而 rknn-toolkit2 2.3.2 内部依赖它
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from rknn_onnx_compat import patch_onnx_mapping
+
+    patch_onnx_mapping()
+
+    from rknn.api import RKNN
+
+    buf = io.StringIO()
+    rknn = RKNN(verbose=False)
+    with redirect_stdout(buf), redirect_stderr(buf):
+        kwargs = dict(
+            target_platform="rk3588",
+            float_dtype="float16",
+            optimization_level=3,
+            single_core_mode=False,
+        )
+        if disable_rules:
+            kwargs["disable_rules"] = disable_rules
+            log.info("禁用图融合规则: %s", disable_rules)
+        if rknn.config(**kwargs) != 0:
+            return None, buf.getvalue() + "\n[rknn.config 失败]"
+        if rknn.load_onnx(model=onnx_path) != 0:
+            return None, buf.getvalue() + "\n[load_onnx 失败]"
+        # 故意不传 dataset —— do_quantization=False（transformer 图走 fp16）
+        if rknn.build(do_quantization=False) != 0:
+            return None, buf.getvalue() + "\n[build 失败]"
+        if rknn.export_rknn(str(out_path)) != 0:
+            return None, buf.getvalue() + "\n[export_rknn 失败]"
+    return rknn, buf.getvalue()
+
+
+def _find_failing_rule(log_text: str) -> str | None:
+    """从 rknn 日志里提取它建议禁用的融合规则名。"""
+    m = re.search(r"disable_rules=\['([^']+)'\]", log_text)
+    return m.group(1) if m else None
+
+
+def _diagnose_build_failure(log_text: str) -> None:
+    bad = [ln for ln in log_text.splitlines() if "unsupport cpu" in ln.lower()]
+    if bad:
+        log.error("检测到 CPU fallback 相关日志（硬性阻断信号）:")
+        for ln in bad[:6]:
+            log.error("  %s", ln.strip())
+        log.error(
+            "对策：回到 exporter 层改 PyTorch 源码消掉该算子，"
+            "**不要做 ONNX 事后手术**（插入的 Constant 会被 fold_constant/fuse_ops 剥掉）"
+        )
+    err = [ln for ln in log_text.splitlines() if "KeyError" in ln or "Traceback" in ln]
+    if err:
+        log.error("构建异常：")
+        for ln in err[:6]:
+            log.error("  %s", ln.strip())
 
 
 def main() -> int:
@@ -166,43 +235,32 @@ def main() -> int:
         return 2
 
     # ---------- 4. 转 RKNN ----------
-    # ⚠️ 必须在 import rknn 之前打垫片：
-    #    onnx>=1.17 移除了 onnx.mapping，而 rknn-toolkit2 2.3.2 内部依赖它
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from rknn_onnx_compat import patch_onnx_mapping
+    log.info("构建 RKNN（float16，不做量化：transformer 图走 fp16）……")
+    rknn, build_log = _try_build(onnx_path, out_path)
 
-    patch_onnx_mapping(verbose=True)
+    # rknn-toolkit2 2.3.2 的图融合有缺陷：标准 LayerNormalization 会命中
+    # convert_layernorm_to_exnorm 规则并抛 KeyError: 'LayerNormalization'。
+    # ACT 的 transformer 解码器含 LayerNorm，所以这条回退是必需的。
+    # 工具自己在日志里给出了规则名，这里解析出来自动重试。
+    fallback_used: str | None = None
+    if rknn is None:
+        rule = _find_failing_rule(build_log)
+        if rule:
+            log.warning("默认构建失败，工具建议禁用图融合规则 '%s'，自动重试……", rule)
+            rknn, build_log = _try_build(onnx_path, out_path, disable_rules=[rule])
+            if rknn is not None:
+                fallback_used = rule
+                log.warning("禁用规则 '%s' 后构建成功（该规则有缺陷，仅影响图优化不影响算子支持）", rule)
 
-    from rknn.api import RKNN
-
-    rknn = RKNN(verbose=False)
-    log.info("rknn.config(target_platform='rk3588', float_dtype='float16')")
-    ret = rknn.config(
-        target_platform="rk3588",
-        float_dtype="float16",
-        optimization_level=3,
-        single_core_mode=False,
-    )
-    if ret != 0:
-        log.error("rknn.config 失败 ret=%d", ret)
+    if rknn is None:
+        log.error("=" * 70)
+        log.error("RKNN 构建失败。完整日志如下：")
+        for ln in build_log.splitlines()[-40:]:
+            log.error("  %s", ln)
+        _diagnose_build_failure(build_log)
+        log.error("=" * 70)
         return 3
 
-    log.info("加载 ONNX 并构建（不做量化：transformer 图走 fp16）……")
-    if rknn.load_onnx(model=onnx_path) != 0:
-        log.error("load_onnx 失败")
-        return 3
-    # 故意不传 dataset —— do_quantization=False
-    if rknn.build(do_quantization=False) != 0:
-        log.error(
-            "build 失败。请检查转换日志里是否出现 `unsupport cpu <Op> op` —— "
-            "那是硬性阻断，不要指望 CPU fallback 兜底。\n"
-            "对策：回到 exporter 层改 PyTorch 源码消掉该算子，**不要做 ONNX 事后手术**"
-            "（插入的 Constant 会被 fold_constant/fuse_ops 剥掉）。"
-        )
-        return 3
-    if rknn.export_rknn(str(out_path)) != 0:
-        log.error("export_rknn 失败")
-        return 3
     log.info("已导出 %s (%.1f MB)", out_path, out_path.stat().st_size / 1e6)
 
     # ---------- 5. 暴力确认输入顺序 ----------
@@ -284,6 +342,7 @@ def main() -> int:
         "output_shape": list(ref.shape),
         "verified_max_abs_diff": best_diff,
         "tolerance": args.tol,
+        "build_fallback_disabled_rules": [fallback_used] if fallback_used else [],
         "all_permutations": results,
         "versions": {
             "rknn_toolkit2": toolkit_ver,
