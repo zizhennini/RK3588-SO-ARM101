@@ -165,7 +165,46 @@ ACT 一次产出 100 步动作块。**绝不能"算一步、走一步"**。
 
 ---
 
-## 5. 验收与排查清单
+## 6. RKNN 工具链实测发现（2026-09-19，WSL2 真机验证）
+
+以下 6 条都是**实际跑出来**的，不是推测。前 3 条是环境/工具链缺陷，后 3 条是我自己代码里的 bug
+（其中 T5 如果没端到端跑一遍，会被原样带到板上）。
+
+| # | 现象 | 根因 | 对策 | 状态 |
+|---|---|---|---|---|
+| **T1** | `AttributeError: module 'onnx' has no attribute 'mapping'`，`load_onnx` 直接崩 | onnx≥1.17 移除了 `onnx.mapping`，而 rknn-toolkit2 2.3.2 的 `base_utils.to_np_type` 依赖它 | `pc/convert/rknn_onnx_compat.py` 注入等价垫片（`patch_onnx_mapping()`，须在 `import rknn` 之前调用） | ✅ 已验证修复 |
+| **T2** | `ModuleNotFoundError: No module named 'pkg_resources'` | setuptools≥81 移除了 `pkg_resources`，rknn-toolkit2 内部 import 它 | rknn 环境钉 `setuptools<81`（setup 脚本已内置） | ✅ 已验证修复 |
+| **T3** | 含 LayerNorm 的图 `build` 崩：`KeyError: 'LayerNormalization'`（栈顶 `rules/norm.py::_p_convert_layernorm_to_exnorm`） | rknn-toolkit2 2.3.2 的图融合规则有缺陷。**ACT 的 transformer 解码器含 LayerNorm，必然命中** | `rknn.config(disable_rules=['convert_layernorm_to_exnorm'])` | ✅ **已验证有效**（禁用后转换成功，28 KB 模型） |
+| **T4** | 默认构建失败时脚本直接崩溃，回退逻辑不执行 | **`rknn.build()` 出错时是抛异常，不是返回非零**；只判断返回码会漏掉 | `_try_build()` 整段包 try/except，失败时 release context 并返回日志 | ✅ 已修 |
+| **T5** | `The input(ndarray) shape (1,3,480,640) is wrong, expect 'nhwc' like (1,480,640,3)` | **`rknn.inference()` 的 `data_format` 默认是 `nhwc`**，而我们的 ONNX 是 NCHW | 显式传 `data_format='nchw'`（转换脚本与板端都已钉死）；manifest 记录 `image_layout`；新增 2 个回归测试 | ✅ 已修 + 测试覆盖 |
+| **T6** | `inference: The runtime has not been initialized` | 转换顺序漏了一步 | 正确顺序：`config → load_onnx → build → export_rknn → **init_runtime** → inference` | ✅ 已修 |
+
+**端到端验证结果**（假 ACT ONNX → RKNN）：
+
+```
+输入  observation.state [1,6] + observation.images.front [1,3,480,640]
+输出  action [1,100,6]
+→ 构建：默认失败 → 自动禁用 convert_layernorm_to_exnorm → 成功
+→ 输入顺序：暴力枚举 + 与 ONNX Runtime 比对 → 确认 ["state","front"]
+→ verified_max_abs_diff = 6.88e-4  （容差 1e-2）
+→ manifest 已生成（含 image_layout / build_fallback_disabled_rules）
+```
+
+**可复现的命令**（在 WSL2 的 `rknn` 环境里）：
+
+```bash
+conda activate rknn
+python pc/convert/make_mock_act_onnx.py --out /tmp/mock_act.onnx
+python pc/convert/convert_to_rknn.py --onnx /tmp/mock_act.onnx --out /tmp/mock_act.rknn
+python pc/convert/toolchain_smoketest.py      # 只测工具链本身
+```
+
+**仍未验证**：真实 NPU 上的推理数值（无板卡）、真实 ACT 模型（无微调产物）。
+另外模拟器的算子重排行为**未必与真机一致**，板端最好再复核一次输入顺序。
+
+---
+
+## 7. 验收与排查清单
 
 **每次上板，按顺序走：**
 

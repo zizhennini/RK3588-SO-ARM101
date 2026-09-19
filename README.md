@@ -56,7 +56,7 @@ python rk3588/main.py              # ③ 真机（5 秒倒计时）
 
 ## 已验证 / 未验证（重要）
 
-**已通过单元测试（33/33）**——不需要板卡、串口、RKNN 运行时，缺失依赖用最小桩替代：
+**已通过单元测试（35/35）**——不需要板卡、串口、RKNN 运行时，缺失依赖用最小桩替代：
 
 ```bash
 python tests/run_all.py
@@ -66,12 +66,17 @@ python tests/run_all.py
 |---|---|
 | `test_action_queue.py` (11) | 线性消费、上/降采样插值、跨块平滑、饥饿 hold 与计数、陈旧块丢弃、容量溢出、非法块拒绝 |
 | `test_feetech_protocol.py` (11) | 校验和（手算期望值）、READ/WRITE/SYNC_WRITE 字节级包结构、符号-幅值编解码、SYNC_READ 解析、坏校验和拒绝、寄存器地址回归保护（Goal_Position 必须是 42） |
-| `test_config_and_guards.py` (11) | 配置自洽性（关节/ID/限位/维度）、manifest 缺失拒绝运行、输出 NaN/全零/形状错必须报错、图像预处理形状/通道顺序/padding 锚点 |
+| `test_config_and_guards.py` (13) | 配置自洽性（关节/ID/限位/维度）、manifest 缺失拒绝运行、输出 NaN/全零/形状错必须报错、图像预处理形状/通道顺序/padding 锚点、**`data_format='nchw'` 回归保护** |
 
 **尚未验证**：`feetech_bus.py` 的真实串口收发、`act_rknn.py` 的真实 NPU 推理、
-`convert_to_rknn.py` 的真实 RKNN 转换、`export_denorm_params.py` 的 LeRobot API 对接点
-（该文件里有两处标了 `⚠️ 适配点`，需要按你的 LeRobot 版本补齐）。
-开发机没有板卡、没有串口设备、也无法访问 WSL2（沙箱拒绝），这些都必须在真机上验收。
+`export_denorm_params.py` 的 LeRobot API 对接点（该文件里有两处标了 `⚠️ 适配点`，
+需要按你的 LeRobot 版本补齐）。
+
+**工具链已端到端跑通**（在 WSL2 的 `rknn` 环境，用假 ACT 模型）：
+ONNX → RKNN 转换（含 LayerNorm 融合规则自动回退）→ 输入顺序暴力确认 → manifest，
+`verified_max_abs_diff = 6.88e-4`。踩到的 6 个工具链/代码缺陷见
+`docs/act-pipeline.md` 第 6 节 —— 其中包括 **`rknn.inference` 默认按 NHWC 解释输入**
+这个原本会被带到板上的坑。
 
 ## WSL2 环境（已搭好，2026-09-19）
 
