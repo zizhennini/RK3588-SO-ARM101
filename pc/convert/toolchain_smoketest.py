@@ -86,8 +86,14 @@ def make_layernorm_onnx(path: Path) -> None:
     onnx.save(model, str(path))
 
 
-def convert(onnx_path: Path, rknn_path: Path) -> tuple[bool, str]:
-    """返回 (是否成功, 日志)。"""
+def convert(onnx_path: Path, rknn_path: Path,
+            disable_rules: list[str] | None = None) -> tuple[bool, str]:
+    """返回 (是否成功, 日志)。
+
+    disable_rules 用于绕开 rknn-toolkit2 有缺陷的图融合规则
+    （例如 convert_layernorm_to_exnorm 会在标准 LayerNormalization 上抛
+      KeyError: 'LayerNormalization'）。
+    """
     # ⚠️ 必须在 import rknn 之前打垫片（onnx>=1.17 移除了 onnx.mapping）
     from rknn_onnx_compat import patch_onnx_mapping
 
@@ -99,12 +105,15 @@ def convert(onnx_path: Path, rknn_path: Path) -> tuple[bool, str]:
     rknn = RKNN(verbose=False)
     try:
         with redirect_stdout(buf), redirect_stderr(buf):
-            ret = rknn.config(
+            kwargs = dict(
                 target_platform="rk3588",
                 float_dtype="float16",
                 optimization_level=3,
                 single_core_mode=False,
             )
+            if disable_rules:
+                kwargs["disable_rules"] = disable_rules
+            ret = rknn.config(**kwargs)
             if ret != 0:
                 return False, buf.getvalue() + f"\n[rknn.config ret={ret}]"
             if rknn.load_onnx(model=str(onnx_path)) != 0:
@@ -178,8 +187,27 @@ def main() -> int:
 
     p2 = OUT_DIR / "layernorm.onnx"
     make_layernorm_onnx(p2)
+
+    print("\n--- LayerNormalization（transformer 关键算子）---")
     ok2, log2 = convert(p2, OUT_DIR / "layernorm.rknn")
-    report("LayerNormalization（transformer 关键算子）", ok2, log2, OUT_DIR / "layernorm.rknn")
+    print(f"  [默认配置] 转换结果: {'成功' if ok2 else '失败'}")
+    if not ok2:
+        rule_hit = "convert_layernorm_to_exnorm" in log2
+        print(f"  触发融合规则 convert_layernorm_to_exnorm: {rule_hit}")
+        if rule_hit:
+            print("  工具自己给的提示: disable_rules=['convert_layernorm_to_exnorm']")
+            print("  -> 用该 rule 重试……")
+            ok3, log3 = convert(p2, OUT_DIR / "layernorm_norule.rknn",
+                                disable_rules=["convert_layernorm_to_exnorm"])
+            report("LayerNormalization（禁用问题融合规则后）", ok3, log3,
+                   OUT_DIR / "layernorm_norule.rknn")
+            print(f"\n  ** 绕法结论: {'有效 —— 转换脚本应内置此回退' if ok3 else '无效，需要改图分解 LayerNorm'} **")
+        else:
+            bad = [ln for ln in log2.splitlines() if "unsupport cpu" in ln.lower()]
+            if bad:
+                print("  出现 `unsupport cpu`：需要在 exporter 层消除该算子")
+    else:
+        report("LayerNormalization", ok2, log2, OUT_DIR / "layernorm.rknn")
 
     # RKNN 无板卡时不能跑推理；这里只确认 ONNX 本身可用作参考
     import onnxruntime as ort
