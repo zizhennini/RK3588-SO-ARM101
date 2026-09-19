@@ -203,17 +203,34 @@ def export_from_policy(policy_path: Path, output: Path, device: str, opset: int)
     stripped = output.with_name(f"{output.stem}_stripped.onnx")
 
     log(f"导出 ONNX（opset={opset}，只保留 action 输出）……")
+    export_kwargs = dict(
+        input_names=input_names,
+        opset_version=opset,
+        output_names=["action"],
+        do_constant_folding=True,
+        verbose=False,
+    )
     with torch.no_grad():
-        torch.onnx.export(
-            wrapped,
-            tuple(dummy),
-            str(raw),
-            input_names=input_names,
-            opset_version=opset,
-            output_names=["action"],
-            do_constant_folding=True,
-            verbose=False,
-        )
+        try:
+            # ⚠️ 强制走 TorchScript 版导出器（dynamo=False）。
+            #    torch>=2.9 默认用 dynamo 版，它会要求安装 onnxscript，
+            #    而且产出的图结构与 rknn-toolkit2 的兼容性更不可控。
+            #    IB_Robot 实测跑通的 ACT 导出用的就是 TorchScript 路径。
+            torch.onnx.export(wrapped, tuple(dummy), str(raw), dynamo=False, **export_kwargs)
+        except TypeError as e:
+            # 老版本 torch 没有 dynamo 参数
+            if "dynamo" not in str(e):
+                raise
+            log("当前 torch 不支持 dynamo 参数，回退到默认导出器")
+            torch.onnx.export(wrapped, tuple(dummy), str(raw), **export_kwargs)
+        except ModuleNotFoundError as e:
+            if "onnxscript" not in str(e):
+                raise
+            raise RuntimeError(
+                "导出器要求 onnxscript。两种解法：\n"
+                "  a) pip install onnxscript        （用 dynamo 导出器）\n"
+                "  b) 确保 torch.onnx.export 走 dynamo=False（本脚本已默认如此）"
+            ) from e
 
     strip_extra_outputs(raw, stripped)
     simplify_onnx(stripped, output)

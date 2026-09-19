@@ -190,6 +190,15 @@ if [ -x "$CONDA" ]; then
       fail "lerobot 安装失败"
     fi
 
+    # torch>=2.9 的 dynamo 版 ONNX 导出器需要 onnxscript；
+    # 我们的导出脚本强制 dynamo=False，但装上它可避免其他路径踩坑
+    echo "  安装 onnx 导出相关依赖（onnx / onnxsim / onnxscript）……"
+    if run_show "pip install onnx 导出依赖" "$LRPY" -m pip install onnx onnxsim onnxscript; then
+      ok "onnx / onnxsim / onnxscript 已安装"
+    else
+      fail "onnx 导出依赖安装失败（导出脚本已强制 dynamo=False，可能仍可用）"
+    fi
+
     echo "  验证:"
     "$LRPY" - <<'PY' || true
 import importlib
@@ -215,6 +224,53 @@ PY
   fi
 else
   fail "conda 不可用，跳过 lerobot 环境"
+fi
+
+# ---------------------------------------------------------- torchvision 权重 + HF 镜像
+step "torchvision 权重预置 + HuggingFace 镜像"
+# 坑：torchvision 自己下载 resnet18 权重时会卡在 FIN-WAIT-1 ——
+#     数据其实已经传完（.partial 有 46MB），但连接不收尾，
+#     torchvision 就永远不把 .partial 转正，于是 ACT 训练/导出无限阻塞
+#     （实测：进程跑 29 分钟只消耗 6 秒 CPU）。必须自己用 curl 下好放进去。
+CKPT="$HOME/.cache/torch/hub/checkpoints"
+mkdir -p "$CKPT"
+R18="$CKPT/resnet18-f37072fd.pth"
+if [ -s "$R18" ]; then
+  skip "resnet18 权重已存在 ($(stat -c%s "$R18") 字节)"
+else
+  echo "  下载 resnet18 预训练权重……"
+  rm -f "$CKPT"/*.partial 2>/dev/null
+  if curl -L --fail --retry 8 --retry-delay 3 --retry-all-errors -C - \
+        --connect-timeout 20 --max-time 1800 -o "$R18" \
+        https://download.pytorch.org/models/resnet18-f37072fd.pth >/dev/null 2>&1; then
+    ok "resnet18 权重已预置 ($(stat -c%s "$R18") 字节)"
+  else
+    fail "resnet18 权重下载失败 —— ACT 训练与 ONNX 导出都会卡住"
+  fi
+fi
+
+if [ -x "$MINI/envs/lerobot/bin/python" ]; then
+  if "$MINI/envs/lerobot/bin/python" -c "
+from torchvision.models import resnet18, ResNet18_Weights
+resnet18(weights=ResNet18_Weights.DEFAULT)
+" >/dev/null 2>&1; then
+    ok "torchvision 可离线加载 resnet18 权重"
+  else
+    fail "torchvision 仍会尝试联网下载（检查上面的权重文件）"
+  fi
+fi
+
+# 官方 huggingface.co 在本网络不可达（http=000），hf-mirror.com 可用
+if grep -q 'HF_ENDPOINT' "$HOME/.bashrc" 2>/dev/null; then
+  skip "HF_ENDPOINT 已配置"
+else
+  {
+    echo ''
+    echo '# LeRobot 需要 HuggingFace；官方站不可达（http=000），改用镜像'
+    echo 'export HF_ENDPOINT=https://hf-mirror.com'
+    echo 'export HF_HUB_DISABLE_TELEMETRY=1'
+  } >> "$HOME/.bashrc"
+  ok "已写入 HF_ENDPOINT=https://hf-mirror.com 到 ~/.bashrc"
 fi
 
 # ---------------------------------------------------------- 6. rknn 环境
