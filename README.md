@@ -73,6 +73,37 @@ python tests/run_all.py
 （该文件里有两处标了 `⚠️ 适配点`，需要按你的 LeRobot 版本补齐）。
 开发机没有板卡、没有串口设备、也无法访问 WSL2（沙箱拒绝），这些都必须在真机上验收。
 
+## WSL2 环境（已搭好，2026-09-19）
+
+`bash scripts/setup_wsl_conda.sh` 在 WSL2 (Ubuntu 22.04) 里建两个 conda env：
+
+| env | 内容 | 用途 |
+|---|---|---|
+| `lerobot` | Python 3.10、**torch 2.10.0+cu128**、lerobot 0.4.4、numpy 2.2.6、opencv 4.12 | 采集 / 训练 / ONNX 导出 |
+| `rknn` | Python 3.10、rknn-toolkit2 2.3.2、onnx 1.22.0、onnxruntime 1.23.2、**numpy 1.26.4**、torch 2.4.0 | ONNX → RKNN 转换 |
+
+**必须分成两个环境**：lerobot 要 `numpy>=2.0`，rknn-toolkit2 要 `numpy<=1.26.4`，装一起直接冲突。
+
+已验证：
+
+- **WSL2 GPU 直通正常**：`torch.cuda.is_available() == True`，设备 `NVIDIA GeForce RTX 4060 Laptop GPU`
+- 6 个 CLI 全部就位：`lerobot-train` / `lerobot-record` / `lerobot-calibrate` / `lerobot-find-port` / `lerobot-setup-motors` / `lerobot-teleoperate`
+- `tests/run_all.py` 在真实环境里 **33/33 通过**
+
+```bash
+conda activate lerobot     # 采集 / 训练 / 导出
+conda activate rknn        # RKNN 转换
+```
+
+代码在 `~/work/rkrobot`（origin 指向 Windows 侧仓库，`git pull` 即可同步）。
+
+### 装机时踩到的三个坑（脚本已处理）
+
+1. **PyPI 官方源不可达**：`files.pythonhosted.org` 实测 15 秒下 0 字节；pip 进程 12 分钟只消耗 5 秒 CPU（纯阻塞在网络，不是卡在编译）。
+   脚本自动把 `~/.pip/pip.conf` 指向清华镜像（实测约 2 MB/s，装完 torch 全套约 10 分钟）。
+2. **conda 26.x 需要先接受 ToS**，否则 `conda create` 会在 4 秒内静默失败。脚本用 `conda tos accept` + `--override-channels -c conda-forge` 规避。
+3. **WSL2 不继承 Windows 代理**（NAT 模式；宿主 `127.0.0.1:7897` 从 WSL 内不可达）。本机代理未启用，直连镜像即可，无需配置。
+
 ## 全流程
 
 ### 阶段 1 · 硬件与环境

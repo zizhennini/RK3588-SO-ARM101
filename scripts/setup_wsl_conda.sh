@@ -100,7 +100,35 @@ else
   fi
 fi
 
-# ---------------------------------------------------------- 3. Miniconda
+# ---------------------------------------------------------- 3. pip 镜像
+step "pip 源（国内镜像）"
+# 实测：官方 files.pythonhosted.org 在本网络不可达（15s 下 0 字节，
+#       pip 进程 12 分钟仅耗 5s CPU = 纯阻塞）。清华镜像约 2 MB/s。
+# 写入 ~/.pip/pip.conf，对后续所有 pip 生效。
+PIPCONF="$HOME/.pip/pip.conf"
+mkdir -p "$HOME/.pip"
+if grep -q 'tuna.tsinghua' "$PIPCONF" 2>/dev/null; then
+  skip "pip.conf 已指向清华镜像"
+else
+  cat > "$PIPCONF" <<'EOF'
+[global]
+index-url = https://pypi.tuna.tsinghua.edu.cn/simple
+trusted-host = pypi.tuna.tsinghua.edu.cn
+timeout = 60
+retries = 5
+EOF
+  ok "已写入 $PIPCONF（清华镜像）"
+fi
+SPD=$(curl -sS -o /dev/null -m 12 -w '%{speed_download}' \
+      https://pypi.tuna.tsinghua.edu.cn/simple/pip/ 2>/dev/null || echo 0)
+echo "  镜像测速: $(( $(printf '%.0f' "${SPD:-0}") / 1024 )) KB/s"
+if [ "${SPD:-0}" -lt 51200 ] 2>/dev/null; then
+  fail "镜像速度异常（<50 KB/s），安装会很慢"
+else
+  ok "镜像可用"
+fi
+
+# ---------------------------------------------------------- 4. Miniconda
 step "Miniconda"
 if [ -x "$CONDA" ]; then
   skip "已安装: $($CONDA --version 2>&1)"
