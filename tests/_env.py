@@ -106,14 +106,25 @@ def _stub_rknnlite() -> None:
     api = types.ModuleType("rknnlite.api")
 
     class RKNNLite:  # noqa: D401
+        # 记录最后一次 inference 的调用参数，供回归测试断言
+        last_inference_kwargs: dict = {}
+        last_inference_inputs: list | None = None
+        inference_calls: int = 0
+
         def load_rknn(self, *_a, **_k):
             return 0
 
         def init_runtime(self, *_a, **_k):
             return 0
 
-        def inference(self, inputs=None):  # noqa: ARG002
-            return []
+        def inference(self, inputs=None, **kwargs):
+            type(self).last_inference_inputs = inputs
+            type(self).last_inference_kwargs = dict(kwargs)
+            type(self).inference_calls += 1
+            # 返回一个 (1, chunk, dim) 的假输出，值域落在合理范围
+            import numpy as _np
+
+            return [_np.full((1, 100, 6), 0.25, dtype=_np.float32)]
 
         def release(self):
             return 0

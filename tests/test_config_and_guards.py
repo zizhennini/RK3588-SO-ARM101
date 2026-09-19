@@ -222,6 +222,79 @@ def test_prep_image_pad_mode_geometry() -> None:
     assert not np.allclose(out, out2), "两种锚点产生了相同结果，锚点参数没生效"
 
 
+def test_infer_passes_nchw_data_format() -> None:
+    """回归保护：rknn.inference 默认按 nhwc 解释输入，必须显式传 data_format='nchw'。
+
+    实测报错（未传时）：
+        The input(ndarray) shape (1,3,480,640) is wrong,
+        expect 'nhwc' like (1,480,640,3)
+    """
+    from rknnlite.api import RKNNLite
+
+    with _env.tmpdir() as d:
+        manifest = Path(d) / "m.json"
+        manifest.write_text(json.dumps({
+            "input_order": ["state", "front"],
+            "image_slots": ["front"],
+            "image_shapes": {"front": [1, 3, 480, 640]},
+            "image_size": [480, 640],
+            "image_layout": "nchw",
+            "output_shape": [1, 100, 6],
+        }), encoding="utf-8")
+        denorm = Path(d) / "denorm.json"
+        denorm.write_text(json.dumps({
+            "joints": list("abcdef"),
+            "scale": [100.0] * 6,
+            "offset": [2047.0] * 6,
+            "fit_residual_max": 0.0,
+        }), encoding="utf-8")
+
+        cfg = ActConfig(
+            rknn_model=str(Path(d) / "fake.rknn"),
+            manifest=str(manifest),
+            denorm_json=str(denorm),
+            action_dim=6, state_dim=6, chunk_size=100,
+        )
+        act = ActRKNN(cfg)
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        out = act.infer({"front": frame}, np.full(6, 2047.0, dtype=np.float32))
+
+        assert RKNNLite.last_inference_kwargs.get("data_format") == "nchw", \
+            f"必须以 nchw 调用，实际: {RKNNLite.last_inference_kwargs}"
+        assert out.shape == (100, 6), out.shape
+        # 反归一化应生效：0.25 * 100 + 2047 = 2072
+        assert np.allclose(out[0], 2072.0, atol=1e-3), out[0]
+
+
+def test_manifest_rejects_non_nchw_layout() -> None:
+    """manifest 声明 nhwc 时应当直接拒绝，而不是悄悄转置。"""
+    with _env.tmpdir() as d:
+        manifest = Path(d) / "m.json"
+        manifest.write_text(json.dumps({
+            "input_order": ["state", "front"],
+            "image_slots": ["front"],
+            "image_size": [480, 640],
+            "image_layout": "nhwc",
+        }), encoding="utf-8")
+        denorm = Path(d) / "denorm.json"
+        denorm.write_text(json.dumps({
+            "joints": list("abcdef"), "scale": [1.0] * 6, "offset": [0.0] * 6,
+        }), encoding="utf-8")
+        cfg = ActConfig(
+            rknn_model=str(Path(d) / "fake.rknn"),
+            manifest=str(manifest), denorm_json=str(denorm),
+            action_dim=6, state_dim=6, chunk_size=100,
+        )
+        act = ActRKNN(cfg)
+        try:
+            act.infer({"front": np.zeros((480, 640, 3), dtype=np.uint8)},
+                      np.zeros(6, dtype=np.float32))
+        except ValueError as e:
+            assert "image_layout" in str(e)
+            return
+        raise AssertionError("nhwc layout 应被拒绝")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

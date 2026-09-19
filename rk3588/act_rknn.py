@@ -102,7 +102,11 @@ class ActRKNN:
 
         self.input_order: list[str] = self.manifest["input_order"]
         self.image_size: tuple[int, int] = tuple(self.manifest["image_size"])  # (H, W)
-        log.info("ACT RKNN 就绪 | 输入顺序=%s | 图像尺寸=%s", self.input_order, self.image_size)
+        self.image_layout: str = str(self.manifest.get("image_layout", "nchw")).lower()
+        if self.image_layout not in ("nchw", "nhwc"):
+            raise ValueError(f"manifest.image_layout 非法: {self.image_layout}")
+        log.info("ACT RKNN 就绪 | 输入顺序=%s | 图像尺寸=%s | layout=%s",
+                 self.input_order, self.image_size, self.image_layout)
 
     # ---------- 加载与校验 ----------
 
@@ -190,8 +194,20 @@ class ActRKNN:
         # 按 manifest 声明的语义顺序组装（state 是 2 维，图像是 4 维）
         inputs = [slots[name] for name in self.input_order]
 
+        # 本类产出的图像张量是 NCHW（_prep_image 里 transpose 过）
+        if self.image_layout != "nchw":
+            raise ValueError(
+                f"manifest 声明 image_layout={self.image_layout}，但本类的预处理产出 NCHW。"
+                "要么改 manifest，要么改 _prep_image —— 不要在这里悄悄转置。"
+            )
+
         t0 = time.perf_counter()
-        outputs = self.rknn.inference(inputs=inputs)
+        # ⚠️ 必须显式声明 data_format='nchw'。
+        #    rknn.inference() 的默认值是 'nhwc'，会把 NCHW 的 (1,3,H,W) 当成
+        #    (1,H,W,3) 去解释，直接报
+        #      "The input(ndarray) shape (1,3,480,640) is wrong, expect 'nhwc' like (1,480,640,3)"
+        #    这类错误在板端表现为推理失败或数值全错，必须在代码里钉死。
+        outputs = self.rknn.inference(inputs=inputs, data_format="nchw")
         dt_ms = (time.perf_counter() - t0) * 1000.0
         self.latency.add(dt_ms)
 

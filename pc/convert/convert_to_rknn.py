@@ -96,7 +96,9 @@ def _ort_run(onnx_path: str, feeds: dict[str, np.ndarray]) -> np.ndarray:
 
 
 def _rknn_run(rknn, feeds_ordered: list[np.ndarray]) -> np.ndarray:
-    outs = rknn.inference(inputs=feeds_ordered)
+    # ⚠️ 必须显式 data_format='nchw'：rknn.inference 默认按 nhwc 解释输入，
+    #    会把 (1,3,480,640) 判成形状错误。
+    outs = rknn.inference(inputs=feeds_ordered, data_format="nchw")
     return np.asarray(outs[0], dtype=np.float32)
 
 
@@ -394,6 +396,8 @@ def main() -> int:
         "image_slots": [slot_of[i] for i in image_idx],
         "image_shapes": img_shapes,
         "image_size": [int(H), int(W)],
+        # 板端必须用这个 layout 调 rknn.inference(data_format=...)
+        "image_layout": "nchw",
         "onnx_input_order": [inputs[i][0] for i in range(len(inputs))],
         "output_shape": list(ref.shape),
         "verified_max_abs_diff": best_diff,
