@@ -1,0 +1,34 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.venv-rknn/
+venv/
+
+# ---- 测试临时目录 ----
+.testtmp/
+.piptmp/
+
+# ---- 模型 / 数据（外部存储，不入库；用 Git LFS 或 HF Hub 管理） ----
+models/
+outputs/
+datasets/
+*.rknn
+*.onnx
+*.pt
+*.safetensors
+*.hbm
+*.om
+
+# ---- 标定与运行产物（含机器唯一信息） ----
+configs/denorm.json
+*.calibrate.json
+logs/
+*.log
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

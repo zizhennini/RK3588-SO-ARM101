@@ -1,0 +1,16 @@
+# RK3588 板端最小依赖（目标：不引入 torch）
+#
+# 反归一化在板端只做一次仿射变换 raw = scale*out + offset，
+# 用 numpy 读 configs/denorm.json 即可，不需要 torch。
+# 这是本路线相对 SmolVLA 三模块方案的另一个优势：
+# token_embedding / state_projection 那类 host 侧工件在 ACT 上完全不存在。
+
+numpy>=1.24,<2.0
+opencv-python-headless>=4.8
+pyserial>=3.5
+pyyaml>=6.0
+
+# rknnlite 不要用 pip 装 —— 用板厂/官方提供的 rknn_toolkit_lite2 wheel，
+# 版本必须与主机 rknn-toolkit2 匹配（本项目：2.3.2）。
+# 见 scripts/setup_rk3588.sh
+# rknn-toolkit-lite2==2.3.2

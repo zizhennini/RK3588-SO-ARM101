@@ -1,0 +1,112 @@
+# rkrobot 运行配置
+# 所有影响动作的参数都在这里，不要在代码里写死第二套。
+
+robot:
+  name: so101_follower
+  port: /dev/ttyACM0
+  baudrate: 1000000
+
+  # 关节顺序 = 模型输出的 action 维度顺序，必须与训练数据集一致
+  joints:
+    - shoulder_pan
+    - shoulder_lift
+    - elbow_flex
+    - wrist_flex
+    - wrist_roll
+    - gripper
+
+  # 舵机 ID（lerobot-setup-motors 倒序设置：先 gripper 6，最后 shoulder_pan 1）
+  motor_ids:
+    shoulder_pan: 1
+    shoulder_lift: 2
+    elbow_flex: 3
+    wrist_flex: 4
+    wrist_roll: 5
+    gripper: 6
+
+  # 安全限位（舵机原始计数，0-4095，中心 2047）
+  # ⚠️ 这里给的是保守的整程范围。上板后请按实际机械结构收窄，
+  #    宁可范围小一点，也不要第一次就跑满程撞结构。
+  raw_limits:
+    shoulder_pan:  [700, 3400]
+    shoulder_lift: [700, 3400]
+    elbow_flex:    [700, 3400]
+    wrist_flex:    [700, 3400]
+    wrist_roll:    [700, 3400]
+    gripper:       [900, 3200]
+
+  # 上电时是否松开扭矩（调试用；闭环运行时为 false）
+  torque_on_startup: false
+
+camera:
+  # 训练时使用的图像键名（LeRobot 数据集里的 feature key），必须一致
+  feature_key: observation.images.front
+  # opencv 的 index_or_path。D435i 用 V4L2 直读时大概是 /dev/video*；
+  # 用 by-id 固定，不要用会变的编号。
+  index_or_path: 0
+  width: 640
+  height: 480
+  fps: 30
+  # 每路相机在策略输入槽位的顺序（单相机保持 [front] 即可）
+  # ⚠️ RKNN 会重排输入顺序，此项只描述"训练时的语义顺序"，
+  #    实际传参顺序由 models/*.manifest.json 里的 input_order 决定。
+  slots: [front]
+
+policy:
+  type: act
+  chunk_size: 100          # ACT 一次输出的动作步数（LeRobot 默认 100）
+  action_dim: 6            # SO-ARM101 = 5 关节 + 夹爪
+  state_dim: 6
+  dataset_fps: 30          # 采集时的 fps —— 决定一个动作块覆盖多少秒
+
+  # 图像预处理
+  # ⚠️ 这两项**必须**用 PC 侧 dump 出来的真实张量逐元素核对，不要猜。
+  #    做法：在 PC 上拿同一张图，分别打印 LeRobot 送给 policy 的张量与板端
+  #    _prep_image 的输出，逐元素比较（不能只比 shape）。
+  image_norm: zero_one     # none | zero_one | imagenet
+  image_resize: squash     # squash | pad（pad = 等比例缩放 + 补零）
+  # pad 模式下的补零锚点：
+  #   top_left     = 补零在顶部/左侧，图像内容靠右下（与 IB_Robot 实测记录一致，默认）
+  #   bottom_right = 补零在底部/右侧，图像内容靠左上
+  image_pad_anchor: top_left
+
+  # 反归一化参数（由 pc/convert/export_denorm_params.py 生成）
+  denorm_json: configs/denorm.json
+  # RKNN 模型
+  rknn_model: models/act_pen_place.rknn
+  # 转换时自动确认的输入顺序（由 convert_to_rknn.py 写入并校验）
+  manifest: models/act_pen_place.rknn.manifest.json
+
+runtime:
+  # 舵机更新频率。一般等于 dataset_fps；降低它可以让动作更慢更安全
+  control_freq_hz: 30
+
+  # 队列剩余步数低于该值时提前触发下一次推理（异步，不阻塞控制）
+  refill_threshold: 60
+
+  # 队列中最多缓存的动作步数（防止推理过快堆积）
+  queue_max_steps: 200
+
+  # 动作块超过该时长视为陈旧，丢弃不执行
+  max_chunk_age_s: 3.0
+
+  # 队列空时的行为：hold = 保持最后位置；error = 立即停机
+  on_queue_empty: hold
+
+  # 线性插值把动作块从 dataset_fps 升/降到 control_freq_hz
+  interpolate: true
+
+  # 跨块平滑步数：新块生效时，从上一块末值线性过渡这么多步。
+  # 这是 RTC（需要 autograd，静态 RKNN 图无法表达）的廉价替代。
+  # 设 0 关闭。
+  blend_steps: 5
+
+  # 单次推理输出的动作超过该比例全零就判定异常（防静默失效）
+  zero_ratio_error: 0.98
+
+  # 关节单步最大变化量（原始计数）。防止抖跳；0 表示不限制。
+  max_delta_per_step: 0
+
+logging:
+  level: INFO
+  jsonl: logs/run.jsonl      # 每步记录：t, target_raw, queue_len, starve_count

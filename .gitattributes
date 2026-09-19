@@ -1,0 +1,21 @@
+# 这些代码要在 Linux（RK3588 / WSL2）上运行，强制 LF，避免 CRLF 导致
+# shell 脚本报 `bad interpreter: No such file or directory`
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.py   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.md   text eol=lf
+
+# 二进制模型文件（走 Git LFS 时保留）
+*.rknn  binary
+*.onnx  binary
+*.pt    binary
+*.safetensors binary
+*.png   binary
+*.jpg   binary
+*.mp4   binary
+
+# Git LFS（RKNN 三模块或 ACT 单模块共约 114 MB，GitHub Free 的 2GB 额度内）
+# *.rknn filter=lfs diff=lfs merge=lfs -text
