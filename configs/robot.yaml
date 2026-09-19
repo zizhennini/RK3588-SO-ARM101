@@ -1,10 +1,17 @@
 # rkrobot 运行配置
-# 所有影响动作的参数都在这里，不要在代码里写死第二套。
+#
+# ⚠️ 坐标系约定（很容易搞错）
+#   LeRobot 的 SO 系列机械臂用 RANGE_M100_100 归一化：
+#   `robot.get_observation()["<motor>.pos"]` 与 `robot.send_action({...})`
+#   的取值范围都是 **[-100, 100]**（由标定文件把实际行程映射过来），
+#   既不是舵机原始计数(0-4095)，也不是原始角度。
+#   本文件里所有与动作相关的限值都用这个单位。
 
 robot:
-  name: so101_follower
+  type: so101_follower        # LeRobot 的机器人注册名
   port: /dev/ttyACM0
-  baudrate: 1000000
+  # 标定文件名的一部分，必须与 lerobot-calibrate --robot.id 一致
+  id: my_follower
 
   # 关节顺序 = 模型输出的 action 维度顺序，必须与训练数据集一致
   joints:
@@ -15,42 +22,35 @@ robot:
     - wrist_roll
     - gripper
 
-  # 舵机 ID（lerobot-setup-motors 倒序设置：先 gripper 6，最后 shoulder_pan 1）
-  motor_ids:
-    shoulder_pan: 1
-    shoulder_lift: 2
-    elbow_flex: 3
-    wrist_flex: 4
-    wrist_roll: 5
-    gripper: 6
+  # LeRobot 自带的安全限速：单次目标相对当前位置的最大跳变（同 [-100,100] 单位）。
+  # 这是最主要的安全机制，建议一开始设小一点（如 5），确认动作方向对之后再放大。
+  # 设为 null 关闭（不推荐）。
+  max_relative_target: 5.0
 
-  # 安全限位（舵机原始计数，0-4095，中心 2047）
-  # ⚠️ 这里给的是保守的整程范围。上板后请按实际机械结构收窄，
-  #    宁可范围小一点，也不要第一次就跑满程撞结构。
-  raw_limits:
-    shoulder_pan:  [700, 3400]
-    shoulder_lift: [700, 3400]
-    elbow_flex:    [700, 3400]
-    wrist_flex:    [700, 3400]
-    wrist_roll:    [700, 3400]
-    gripper:       [900, 3200]
+  # 额外的绝对限位（同单位，[-100,100]）。null 表示只用标定行程与 max_relative_target。
+  # 想把某个关节钉死更窄的范围时再填，例如让夹爪不要撞到底。
+  action_limits: null
+  # action_limits:
+  #   shoulder_pan:  [-60, 60]
+  #   gripper:       [-80, 40]
 
-  # 上电时是否松开扭矩（调试用；闭环运行时为 false）
-  torque_on_startup: false
+  # 与 LeRobot 的动作空间保持一致（默认 true，改动会影响与数据集的兼容性）
+  use_degrees: true
 
 camera:
-  # 训练时使用的图像键名（LeRobot 数据集里的 feature key），必须一致
-  feature_key: observation.images.front
-  # opencv 的 index_or_path。D435i 用 V4L2 直读时大概是 /dev/video*；
-  # 用 by-id 固定，不要用会变的编号。
+  # 图像槽位名必须与训练时数据集里的相机键一致：
+  #   数据集键 observation.images.<slot>  ->  这里写 <slot>
+  # 只用一个相机就写一个；多相机加多行。
+  slots: [front]
+
+  # opencv 的 index_or_path。D435i 用 V4L2 直读时形如 /dev/video4；
+  # ⚠️ 不要用会变的编号，建议用 udev 固定路径。
   index_or_path: 0
   width: 640
   height: 480
   fps: 30
-  # 每路相机在策略输入槽位的顺序（单相机保持 [front] 即可）
-  # ⚠️ RKNN 会重排输入顺序，此项只描述"训练时的语义顺序"，
-  #    实际传参顺序由 models/*.manifest.json 里的 input_order 决定。
-  slots: [front]
+  # 1080p 下建议 MJPG；640x480 一般不必填（null = 自动）
+  fourcc: null
 
 policy:
   type: act
@@ -58,55 +58,43 @@ policy:
   action_dim: 6            # SO-ARM101 = 5 关节 + 夹爪
   state_dim: 6
   dataset_fps: 30          # 采集时的 fps —— 决定一个动作块覆盖多少秒
+  image_slots: [front]     # 必须与 manifests 的 image_slots 一致
 
   # 图像预处理
-  # ⚠️ 这两项**必须**用 PC 侧 dump 出来的真实张量逐元素核对，不要猜。
-  #    做法：在 PC 上拿同一张图，分别打印 LeRobot 送给 policy 的张量与板端
-  #    _prep_image 的输出，逐元素比较（不能只比 shape）。
-  image_norm: zero_one     # none | zero_one | imagenet
-  image_resize: squash     # squash | pad（pad = 等比例缩放 + 补零）
-  # pad 模式下的补零锚点：
-  #   top_left     = 补零在顶部/左侧，图像内容靠右下（与 IB_Robot 实测记录一致，默认）
-  #   bottom_right = 补零在底部/右侧，图像内容靠左上
+  # ⚠️ 必须与 LeRobot 的预处理逐元素核对。注意 LeRobot 的相机默认输出 **RGB**，
+  #    所以板端不要再做 BGR->RGB 转换。
+  #    pad 模式的补零锚点：top_left = 内容靠右下（与 IB_Robot 实测记录一致）
   image_pad_anchor: top_left
 
-  # 反归一化参数（由 pc/convert/export_denorm_params.py 生成）
-  denorm_json: configs/denorm.json
-  # RKNN 模型
+  # 归一化统计量目录（由 pc/convert/export_norm_stats.py 生成）
+  # ACT 的 VISUAL / STATE / ACTION 三路都是 MEAN_STD，图像也要用数据集统计量做 z-score，
+  # 只做 /255 是错的。
+  norm_stats_dir: models/norm_stats
+
+  # RKNN 模型与转换时自动确认的输入顺序
   rknn_model: models/act_pen_place.rknn
-  # 转换时自动确认的输入顺序（由 convert_to_rknn.py 写入并校验）
   manifest: models/act_pen_place.rknn.manifest.json
 
 runtime:
-  # 舵机更新频率。一般等于 dataset_fps；降低它可以让动作更慢更安全
+  # 舵机更新频率，一般等于 camera.fps
   control_freq_hz: 30
-
-  # 队列剩余步数低于该值时提前触发下一次推理（异步，不阻塞控制）
-  refill_threshold: 60
-
-  # 队列中最多缓存的动作步数（防止推理过快堆积）
-  queue_max_steps: 200
 
   # 动作块超过该时长视为陈旧，丢弃不执行
   max_chunk_age_s: 3.0
 
-  # 队列空时的行为：hold = 保持最后位置；error = 立即停机
-  on_queue_empty: hold
-
-  # 线性插值把动作块从 dataset_fps 升/降到 control_freq_hz
+  # 数据集 fps 与 control_freq_hz 不同时做线性插值
   interpolate: true
 
-  # 跨块平滑步数：新块生效时，从上一块末值线性过渡这么多步。
-  # 这是 RTC（需要 autograd，静态 RKNN 图无法表达）的廉价替代。
-  # 设 0 关闭。
-  blend_steps: 5
+  # 跨块平滑步数：新块生效时从上一块末值线性过渡这么多步。
+  # RTC 需要 autograd、静态 RKNN 图无法表达，这里用便宜的线性过渡顶上。0 = 关闭。
+  blend_steps: 0
 
-  # 单次推理输出的动作超过该比例全零就判定异常（防静默失效）
+  # 队列空时：hold = 保持上一步（并计数）；error = 立即停机
+  on_queue_empty: hold
+
+  # 单次推理输出超过该比例全零即判定异常（防静默失效）
   zero_ratio_error: 0.98
-
-  # 关节单步最大变化量（原始计数）。防止抖跳；0 表示不限制。
-  max_delta_per_step: 0
 
 logging:
   level: INFO
-  jsonl: logs/run.jsonl      # 每步记录：t, target_raw, queue_len, starve_count
+  jsonl: logs/run.jsonl      # 每秒一行：目标位置、队列长度、饥饿计数、延迟分位

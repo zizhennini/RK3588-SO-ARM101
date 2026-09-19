@@ -1,22 +1,19 @@
-"""闭环主程序：相机 → ACT(RKNN) → 动作块队列 → 舵机。
+"""板端闭环主程序。
 
-三种运行模式，**必须按顺序放行**：
+结构照搬 D-Robotics/rdk_LeRobot_tools 的 `bpu_control_robot.py`：
+**单线程、队列空了才推理、推理完直接出队执行**。ACT 一次推理约 121 ms，
+而一个动作块（100 步 @30fps）覆盖 3.3 秒，inline 推理完全够用 ——
+没必要上多线程那套复杂度。
 
-    --once      只跑一次推理，打印延迟/形状/数值统计后退出（不碰舵机）
-    --dry-run   持续闭环，但**不写舵机**（验证延迟、队列、饥饿率）
-    （默认）     真机闭环
+机械臂与相机都交给 **LeRobot 自己的驱动**（`SOFollower` + `OpenCVCamera`），
+不再自己实现 Feetech 协议。这些模块不依赖 torch，板端用
+`pip install --no-deps lerobot` + 少量运行时依赖即可（见 requirements.txt）。
 
-线程模型
---------
-    control 线程 @ control_freq_hz
-        └─ ActionQueue.pop() → 限位钳制 → 写舵机
-           队列剩余 < refill_threshold 时置事件，通知推理线程补块
+三种模式，必须按顺序放行：
 
-    inference 线程
-        └─ 取最新帧 + 当前关节状态 → ActRKNN.infer() → 反归一化 → push 动作块
-
-推理异步是关键：T_infer ≈ 121 ms 远小于一个动作块的时长（100 步 / 30 fps ≈ 3.3 s），
-所以可以提前算好下一块，控制线程永远不会被推理阻塞。
+    --once      只跑一次推理，打印延迟/形状/数值范围，不碰舵机
+    --dry-run   持续闭环，但不写舵机（验证延迟、队列、饥饿率）
+    （默认）     真机闭环（5 秒倒计时）
 
 未实测：本文件尚未在真实 RK3588 + SO-ARM101 上运行过。
 """
@@ -28,292 +25,244 @@ import json
 import logging
 import signal
 import sys
-import threading
 import time
 from pathlib import Path
 
 import numpy as np
 import yaml
 
-from action_queue import ActionQueue
 from act_rknn import ActConfig, ActRKNN
+from action_queue import ActionQueue
 
 log = logging.getLogger("rkrobot")
 
 
-class _Stopper:
-    def __init__(self) -> None:
-        self._ev = threading.Event()
+def busy_wait(seconds: float) -> None:
+    """等到 seconds 秒之后（尾段自旋，避免 time.sleep 精度不足）。
 
-    def stop(self, *_a) -> None:
-        if not self._ev.is_set():
+    自己实现是为了不依赖 LeRobot 内部工具函数的版本位置
+    （rdk 的脚本用的是旧版路径 `lerobot.common.robot_devices.control_utils`，
+     在 0.4.4 上已经不存在）。
+    """
+    if seconds <= 0:
+        return
+    deadline = time.perf_counter() + seconds
+    if seconds > 0.01:
+        time.sleep(seconds - 0.005)
+    while time.perf_counter() < deadline:
+        pass
+
+
+class _Stop:
+    def __init__(self) -> None:
+        self._flag = False
+
+    def __call__(self, *_a) -> None:
+        if not self._flag:
             log.warning("收到停止信号，正在停机……")
-            self._ev.set()
+            self._flag = True
 
     @property
     def stopped(self) -> bool:
-        return self._ev.is_set()
+        return self._flag
 
 
-def load_configs(path: str) -> dict:
+def build_robot(cfg: dict):
+    """用 LeRobot 自己的 SOFollower 驱动搭建机械臂（含相机）。"""
+    from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
+    from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
+    from lerobot.robots.so_follower.so_follower import SOFollower
+
+    rc = cfg["robot"]
+    cc = cfg["camera"]
+
+    # ⚠️ LeRobot 的相机默认 color_mode=RGB —— 正是 act_rknn._prep_image 期望的输入
+    cameras = {
+        slot: OpenCVCameraConfig(
+            index_or_path=cc["index_or_path"],
+            fps=int(cc["fps"]),
+            width=int(cc["width"]),
+            height=int(cc["height"]),
+            fourcc=cc.get("fourcc"),
+        )
+        for slot in cfg["policy"]["image_slots"]
+    }
+
+    robot_cfg = SOFollowerRobotConfig(
+        port=rc["port"],
+        id=rc.get("id"),
+        cameras=cameras,
+        # LeRobot 自带的安全限速：单次目标相对当前位置的最大跳变（度）
+        max_relative_target=rc.get("max_relative_target"),
+        # 与数据集/策略的动作空间保持一致（LeRobot 默认 True）
+        use_degrees=bool(rc.get("use_degrees", True)),
+    )
+    return SOFollower(robot_cfg)
+
+
+def load_config(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
 def build_act(cfg: dict) -> ActRKNN:
-    pol = cfg["policy"]
-    cam = cfg["camera"]
+    p = cfg["policy"]
     return ActRKNN(
         ActConfig(
-            rknn_model=pol["rknn_model"],
-            manifest=pol["manifest"],
-            denorm_json=pol["denorm_json"],
-            action_dim=int(pol["action_dim"]),
-            state_dim=int(pol["state_dim"]),
-            chunk_size=int(pol["chunk_size"]),
-            image_norm=pol.get("image_norm", "zero_one"),
-            image_resize=pol.get("image_resize", "squash"),
-            image_pad_anchor=pol.get("image_pad_anchor", "top_left"),
+            rknn_model=p["rknn_model"],
+            manifest=p["manifest"],
+            norm_stats_dir=p["norm_stats_dir"],
+            action_dim=int(p["action_dim"]),
+            state_dim=int(p["state_dim"]),
+            chunk_size=int(p["chunk_size"]),
+            image_pad_anchor=p.get("image_pad_anchor", "top_left"),
             zero_ratio_error=float(cfg["runtime"].get("zero_ratio_error", 0.98)),
         )
     )
 
 
-def clamp_raw(targets: np.ndarray, cfg: dict) -> np.ndarray:
-    """按 configs/robot.yaml 的 raw_limits 做最后一道限位。"""
-    joints = cfg["robot"]["joints"]
-    limits = cfg["robot"]["raw_limits"]
-    out = np.asarray(targets, dtype=np.float32).copy()
-    for i, j in enumerate(joints):
-        lo, hi = limits[j]
-        out[i] = float(np.clip(out[i], lo, hi))
-    return out
+def obs_to_state(obs: dict, joints: list[str]) -> np.ndarray:
+    """LeRobot 的 observation 是 {'<motor>.pos': float, '<camera>': ndarray}。"""
+    return np.asarray([float(obs[f"{j}.pos"]) for j in joints], dtype=np.float32)
 
 
-class Camera:
-    """最简单的取流封装：只保留最新一帧。"""
+def state_to_action(target: np.ndarray, joints: list[str]) -> dict:
+    return {f"{j}.pos": float(v) for j, v in zip(joints, target, strict=True)}
 
-    def __init__(self, cfg: dict):
-        import cv2
 
-        cam = cfg["camera"]
-        self.cv2 = cv2
-        self.cap = cv2.VideoCapture(cam["index_or_path"])
-        if not self.cap.isOpened():
-            raise RuntimeError(f"打不开相机: {cam['index_or_path']}")
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, cam["width"])
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cam["height"])
-        self.cap.set(cv2.CAP_PROP_FPS, cam["fps"])
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        self._lock = threading.Lock()
-        self._frame: np.ndarray | None = None
-        self._stop = threading.Event()
-        self._t = threading.Thread(target=self._loop, daemon=True)
-
-    def start(self) -> None:
-        self._t.start()
-
-    def _loop(self) -> None:
-        misses = 0
-        while not self._stop.is_set():
-            ok, frame = self.cap.read()
-            if not ok:
-                misses += 1
-                if misses % 50 == 0:
-                    log.warning("连续 %d 次取帧失败", misses)
-                time.sleep(0.01)
-                continue
-            misses = 0
-            with self._lock:
-                self._frame = frame
-
-    def latest(self) -> np.ndarray | None:
-        with self._lock:
-            return None if self._frame is None else self._frame.copy()
-
-    def close(self) -> None:
-        self._stop.set()
-        self._t.join(timeout=1.0)
-        self.cap.release()
+def clamp_action(cfg: dict, target: np.ndarray, limits: np.ndarray | None) -> np.ndarray:
+    if limits is None:
+        return target
+    return np.clip(target, limits[:, 0], limits[:, 1]).astype(np.float32)
 
 
 def run(args: argparse.Namespace) -> int:
-    cfg = load_configs(args.config)
+    cfg = load_config(args.config)
     rt = cfg["runtime"]
-    stop = _Stopper()
-    signal.signal(signal.SIGINT, stop.stop)
-    signal.signal(signal.SIGTERM, stop.stop)
+    pol = cfg["policy"]
+    joints = list(cfg["robot"]["joints"])
+    stop = _Stop()
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
 
     log_file = Path(cfg["logging"]["jsonl"])
     log_file.parent.mkdir(parents=True, exist_ok=True)
     jsonl = log_file.open("a", encoding="utf-8")
 
     act = build_act(cfg)
-    joints = cfg["robot"]["joints"]
-    ids = [cfg["robot"]["motor_ids"][j] for j in joints]
+    image_slots = act.image_slots
+    fps = float(cfg["camera"]["fps"])
 
-    image_slots = list(act.manifest.get("image_slots", ["front"]))
-    if len(image_slots) > 1:
-        log.warning(
-            "模型需要 %d 个图像槽位 %s，但当前只有 1 路相机 —— 所有槽位将收到同一帧。"
-            "多相机需要扩展 Camera 以支持多路取流；单相机训练时就应只用一个槽位。",
-            len(image_slots), image_slots,
+    limits = None
+    if cfg["robot"].get("angle_limits"):
+        limits = np.asarray(
+            [cfg["robot"]["angle_limits"][j] for j in joints], dtype=np.float32
         )
 
-    def to_frames(frame: np.ndarray) -> dict[str, np.ndarray]:
-        return {s: frame for s in image_slots}
+    robot = None
+    if not args.dry_run and not args.once:
+        robot = build_robot(cfg)
 
-    # ---------- 模式 1：单次推理 ----------
+    # ---------------- --once：单次推理，不碰舵机 ----------------
     if args.once:
-        cam = Camera(cfg)
-        cam.start()
-        for _ in range(50):
-            if cam.latest() is not None:
-                break
-            time.sleep(0.05)
-        frame = cam.latest()
-        cam.close()
-        if frame is None:
-            log.error("取不到图像")
-            return 2
-        act.warmup(3)
-        state = np.full(len(joints), 2047.0, dtype=np.float32)
-        raw = act.infer(to_frames(frame), state)
-        log.info("输出 shape=%s  延迟=%s", raw.shape, act.latency.summary())
-        log.info("前 3 步原始计数:\n%s", np.round(raw[:3], 1))
-        log.info("每关节范围: %s", {j: (round(float(raw[:, i].min()), 1),
-                                       round(float(raw[:, i].max()), 1))
-                                    for i, j in enumerate(joints)})
-        act.close()
-        jsonl.close()
+        robot = build_robot(cfg)
+        robot.connect()
+        try:
+            obs = robot.get_observation()
+            state = obs_to_state(obs, joints)
+            frames = {s: np.asarray(obs[s]) for s in image_slots}
+            log.info("观测: state=%s | 相机=%s", np.round(state, 2), {k: v.shape for k, v in frames.items()})
+            act.warmup(3)
+            action = act.infer(frames, state)
+            log.info("输出 shape=%s  延迟=%s", action.shape, act.latency.summary())
+            log.info("前 3 步:\n%s", np.round(action[:3], 3))
+            log.info("每关节范围: %s", {
+                j: (round(float(action[:, i].min()), 2), round(float(action[:, i].max()), 2))
+                for i, j in enumerate(joints)
+            })
+        finally:
+            robot.disconnect()
+            act.close()
+            jsonl.close()
         return 0
 
-    # ---------- 模式 2/3：闭环 ----------
-    bus = None
-    if not args.dry_run:
-        from feetech_bus import FeetechBus, load_bus_config
-
-        bus_cfg = load_bus_config(args.config, args.feetech_config)
-        bus = FeetechBus(bus_cfg)
-        bus.open()
-        bus.enable_torque(ids, False)  # 先松扭矩，确认能通信
-        pos = bus.read_present_positions(ids)
-        log.info("初始位置(原始计数): %s", pos)
-
-    cam = Camera(cfg)
-    cam.start()
-
+    # ---------------- 闭环 ----------------
     q = ActionQueue(
-        dataset_fps=float(cfg["policy"]["dataset_fps"]),
+        action_dim=int(pol["action_dim"]),
+        dataset_fps=float(pol["dataset_fps"]),
         control_freq_hz=float(rt["control_freq_hz"]),
-        action_dim=int(cfg["policy"]["action_dim"]),
-        queue_max_steps=int(rt["queue_max_steps"]),
         max_chunk_age_s=float(rt["max_chunk_age_s"]),
         interpolate=bool(rt["interpolate"]),
-        on_queue_empty=rt["on_queue_empty"],
-        blend_steps=int(rt.get("blend_steps", 5)),
+        blend_steps=int(rt.get("blend_steps", 0)),
+        on_empty=str(rt["on_queue_empty"]),
     )
-    refill = threading.Event()
-    refill.set()
-    last_error: list[str] = []
 
-    def inference_worker() -> None:
-        def state_now() -> np.ndarray:
-            if bus is None:
-                return np.full(len(joints), 2047.0, dtype=np.float32)
-            p = bus.read_present_positions(ids)
-            return np.asarray([p[i] for i in ids], dtype=np.float32)
-
-        while not stop.stopped:
-            if not refill.wait(timeout=0.2):
-                continue
-            frame = cam.latest()
-            if frame is None:
-                time.sleep(0.01)
-                continue
-            try:
-                raw = act.infer(to_frames(frame), state_now())
-            except Exception as e:  # noqa: BLE001
-                log.error("推理失败: %s", e)
-                last_error.append(str(e))
-                stop.stop()
-                return
-            q.push(raw, pushed_at=time.monotonic())
-            refill.clear()
-
-    inf_t = threading.Thread(target=inference_worker, daemon=True)
-    inf_t.start()
+    if robot is not None:
+        robot.connect()
+        log.info("机械臂已连接: %s", cfg["robot"]["port"])
+    else:
+        log.info("dry-run：只推理不写舵机")
 
     act.warmup(3)
-    if bus is not None:
-        bus.enable_torque(ids, True)
-        log.info("扭矩已使能，开始闭环控制")
-
-    period = 1.0 / float(rt["control_freq_hz"])
-    prev: np.ndarray | None = None
-    max_delta = float(rt.get("max_delta_per_step", 0) or 0)
     n = 0
     t_start = time.monotonic()
-    next_t = t_start
+    last_log = t_start
 
     try:
         while not stop.stopped:
-            next_t += period
-            target = clamp_raw(q.pop(), cfg)
+            t0 = time.perf_counter()
 
-            if max_delta > 0 and prev is not None:
-                delta = np.clip(target - prev, -max_delta, max_delta)
-                target = prev + delta
-            prev = target
+            obs = robot.get_observation() if robot is not None else None
+            if obs is not None:
+                state = obs_to_state(obs, joints)
+                frames = {s: np.asarray(obs[s]) for s in image_slots}
+            else:
+                state = act.stats.state_mean.copy()
+                frames = {s: np.zeros((int(cfg["camera"]["height"]), int(cfg["camera"]["width"]), 3), np.uint8)
+                          for s in image_slots}
 
-            if bus is not None:
-                bus.write_goal_positions({i: int(round(v)) for i, v in zip(ids, target)})
+            # 照 rdk 的做法：队列空了才推理（inline）
+            if q.steps_available <= 0:
+                q.push(act.infer(frames, state), pushed_at=time.monotonic())
+
+            target = clamp_action(cfg, q.pop(), limits)
+            if robot is not None:
+                robot.send_action(state_to_action(target, joints))
 
             n += 1
-            if q.steps_available < int(rt["refill_threshold"]):
-                refill.set()
-
-            if n % int(cfg["camera"]["fps"]) == 0:
+            now = time.monotonic()
+            if now - last_log >= 1.0:
                 jsonl.write(json.dumps({
-                    "t": round(time.monotonic() - t_start, 3),
-                    "target": [round(float(v), 1) for v in target],
+                    "t": round(now - t_start, 2),
+                    "target": [round(float(v), 2) for v in target],
                     "queue": q.steps_available,
                     **q.stats.as_dict(),
                     **{f"lat_{k}": v for k, v in act.latency.summary().items()},
                 }, ensure_ascii=False) + "\n")
                 jsonl.flush()
+                last_log = now
 
-            sleep = next_t - time.monotonic()
-            if sleep > 0:
-                time.sleep(sleep)
-            else:
-                next_t = time.monotonic()  # 落后了就重新对齐，避免累积漂移
+            busy_wait(1.0 / fps - (time.perf_counter() - t0))
 
     finally:
-        cam.close()
-        if bus is not None:
+        if robot is not None:
             try:
-                bus.enable_torque(ids, False)
-                log.info("扭矩已释放")
+                robot.disconnect()
+                log.info("机械臂已断开（扭矩已按 LeRobot 配置释放）")
             except Exception as e:  # noqa: BLE001
-                log.error("释放扭矩失败（请手动断电）: %s", e)
-            bus.close()
+                log.error("断开失败（请手动断电）: %s", e)
         act.close()
         jsonl.close()
 
     log.info("控制步数=%d  用时=%.1fs", n, time.monotonic() - t_start)
     log.info("队列统计: %s", q.stats.as_dict())
     log.info("推理延迟: %s", act.latency.summary())
-    if last_error:
-        log.error("运行中出现错误: %s", last_error[-1])
-        return 3
     return 0
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="RK3588 + SO-ARM101 ACT 闭环")
+    ap = argparse.ArgumentParser(description="RK3588 + SO-ARM101 ACT 闭环（LeRobot 驱动）")
     ap.add_argument("--config", default="configs/robot.yaml")
-    ap.add_argument("--feetech-config", default="configs/feetech_sts3215.yaml")
     ap.add_argument("--once", action="store_true", help="只跑一次推理，不写舵机")
     ap.add_argument("--dry-run", action="store_true", help="闭环但不写舵机")
     ap.add_argument("--log-level", default="INFO")

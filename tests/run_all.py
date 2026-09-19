@@ -17,9 +17,8 @@ _env.install_stubs()
 
 import test_action_queue  # noqa: E402
 import test_config_and_guards  # noqa: E402
-import test_feetech_protocol  # noqa: E402
 
-MODULES = [test_action_queue, test_feetech_protocol, test_config_and_guards]
+MODULES = [test_action_queue, test_config_and_guards]
 
 
 def main() -> int:

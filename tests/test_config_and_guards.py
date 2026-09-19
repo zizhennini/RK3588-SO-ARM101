@@ -1,8 +1,8 @@
-"""配置与 ActRKNN 防护逻辑测试。
+"""配置自洽性 + 归一化数学 + ActRKNN 防护逻辑测试。
 
-重点验证"静默失败"防线：
-  * manifest 缺失时必须拒绝运行（而不是猜一个输入顺序）
-  * 输出 NaN / 全零 / 形状错时必须报错（而不是照常驱动机械臂）
+重点验证两类问题：
+  * 归一化算错（图像不做 z-score、通道顺序反了）—— 静默失效，动作整体偏
+  * 防护失效（缺 manifest 还跑、输出全零还执行）—— 会动真机
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import _env  # noqa: F401
 _env.install_stubs()
 
 from act_rknn import ActConfig, ActRKNN  # noqa: E402
+from stats import NormStats  # noqa: E402
 
 
 # ---------------- 配置自洽性 ----------------
@@ -35,45 +36,103 @@ def test_robot_config_consistency() -> None:
     assert len(joints) == pol["action_dim"], "joints 数量必须等于 action_dim"
     assert len(joints) == pol["state_dim"], "joints 数量必须等于 state_dim"
     assert len(set(joints)) == len(joints), "关节名重复"
+    assert joints[-1] == "gripper", "最后一个关节应为夹爪"
 
-    ids = cfg["robot"]["motor_ids"]
-    assert set(ids) == set(joints), f"motor_ids 与 joints 不匹配: {set(ids) ^ set(joints)}"
-    assert sorted(ids.values()) == [1, 2, 3, 4, 5, 6], "舵机 ID 应为 1..6 且不重复"
+    # 相机槽位必须与 policy.image_slots 一致
+    assert list(cfg["camera"]["slots"]) == list(pol["image_slots"]), \
+        "camera.slots 与 policy.image_slots 必须一致"
 
-    limits = cfg["robot"]["raw_limits"]
-    assert set(limits) == set(joints), "raw_limits 与 joints 不匹配"
-    for j, (lo, hi) in limits.items():
-        assert 0 <= lo < hi <= 4095, f"{j} 限位非法: [{lo}, {hi}]"
+    # 安全机制：两者至少要有一个开着
+    assert cfg["robot"].get("max_relative_target") is not None or \
+        cfg["robot"].get("action_limits") is not None, \
+        "max_relative_target 与 action_limits 不能同时为空，否则没有安全限制"
+
+    mrt = cfg["robot"].get("max_relative_target")
+    if mrt is not None:
+        assert 0 < mrt <= 100, f"max_relative_target 应在 (0,100]，实际 {mrt}"
 
 
 def test_runtime_config_sane() -> None:
     cfg = _load("robot.yaml")
     rt = cfg["runtime"]
+    pol = cfg["policy"]
+    cam = cfg["camera"]
+
     assert rt["control_freq_hz"] > 0
-    assert 0 < rt["refill_threshold"] <= cfg["policy"]["chunk_size"], \
-        "refill_threshold 应小于等于一个块的步数，否则永远补不上"
-    assert rt["queue_max_steps"] >= cfg["policy"]["chunk_size"], \
-        "queue_max_steps 至少能装下一个完整块"
+    assert cam["fps"] > 0
     assert rt["on_queue_empty"] in ("hold", "error")
-    assert cfg["policy"]["chunk_size"] == 100, "与已验证的 121ms 配置一致 (1,100,6)"
+    assert pol["chunk_size"] == 100, "与已验证的 121ms 配置一致 (1,100,6)"
+    assert rt["max_chunk_age_s"] > 0
+    # 一个动作块覆盖的时长要大于单次推理耗时（121ms 量级）才有意义
+    block_s = pol["chunk_size"] / pol["dataset_fps"]
+    assert block_s > 0.5, f"动作块只覆盖 {block_s:.2f}s，太短"
+    assert pol.get("image_pad_anchor", "top_left") in ("top_left", "bottom_right")
 
 
-def test_feetech_register_table() -> None:
-    ft = _load("feetech_sts3215.yaml")
-    regs = ft["registers"]
-    assert regs["Goal_Position"] == [42, 2]
-    assert regs["Present_Position"] == [56, 2]
-    assert regs["Torque_Enable"] == [40, 1]
-    assert regs["Present_Temperature"] == [63, 1]
-    assert ft["model"]["resolution"] == 4096
-    assert ft["model"]["baudrate"] == 1_000_000
-    assert ft["model"]["model_number"] == 777
+# ---------------- 归一化数学（stats.py） ----------------
+
+def _write_stats(root: Path, cameras=("front",)) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    for c in cameras:
+        np.save(root / f"{c}_mean.npy", np.array([0.5, 0.4, 0.3], dtype=np.float32).reshape(3, 1, 1))
+        np.save(root / f"{c}_std.npy", np.array([0.2, 0.1, 0.25], dtype=np.float32).reshape(3, 1, 1))
+    np.save(root / "state_mean.npy", np.zeros(6, dtype=np.float32))
+    np.save(root / "state_std.npy", np.ones(6, dtype=np.float32))
+    np.save(root / "action_mean.npy", np.arange(6, dtype=np.float32) * 10)
+    np.save(root / "action_std.npy", np.full(6, 2.0, dtype=np.float32))
+    (root / "norm_stats.json").write_text(json.dumps({
+        "format": "rkrobot.norm_stats.v1",
+        "normalization": "MEAN_STD",
+        "cameras": list(cameras),
+    }), encoding="utf-8")
+    return root
 
 
-# ---------------- ActRKNN 防线 ----------------
+def test_norm_stats_image_is_mean_std_not_just_div255() -> None:
+    """图像必须做 z-score。只 /255 是错的，而且不会报错。"""
+    with _env.tmpdir() as d:
+        st = NormStats.load(_write_stats(Path(d)))
+        x = np.full((1, 3, 4, 4), 0.5, dtype=np.float32)  # 三个通道都是 0.5
+        out = st.normalize_image(x, "front")
+        # 0.5 相对各通道 mean/std 的结果应各不相同（说明确实按通道做了 z-score）
+        vals = [float(out[0, c].mean()) for c in range(3)]
+        assert len(set(round(v, 6) for v in vals)) == 3, f"三个通道结果相同，说明没做逐通道 z-score: {vals}"
+        assert np.allclose(vals[0], (0.5 - 0.5) / 0.2), vals
+
+
+def test_norm_stats_action_roundtrip() -> None:
+    with _env.tmpdir() as d:
+        st = NormStats.load(_write_stats(Path(d)))
+        a_norm = np.zeros((2, 6), dtype=np.float32)
+        raw = st.denormalize_action(a_norm)
+        assert np.allclose(raw, np.arange(6) * 10), raw  # 0 * std + mean = mean
+        back = (raw - st.action_mean) / st.action_std
+        assert np.allclose(back, a_norm, atol=1e-5)
+
+
+def test_norm_stats_missing_file_refuses() -> None:
+    with _env.tmpdir() as d:
+        try:
+            NormStats.load(Path(d))
+        except FileNotFoundError as e:
+            assert "norm_stats" in str(e)
+            return
+        raise AssertionError("缺少统计量时必须拒绝运行")
+
+
+def test_norm_stats_dim_mismatch() -> None:
+    with _env.tmpdir() as d:
+        st = NormStats.load(_write_stats(Path(d)))
+        try:
+            st.normalize_state(np.zeros(5, dtype=np.float32))
+        except ValueError:
+            return
+        raise AssertionError("state 维度不符应报错")
+
+
+# ---------------- ActRKNN 防护 ----------------
 
 def _bare(cfg: ActConfig) -> ActRKNN:
-    """绕过 __init__（不需要真 RKNN），只为测防护逻辑。"""
     obj = ActRKNN.__new__(ActRKNN)
     obj.cfg = cfg
     return obj
@@ -83,17 +142,14 @@ def _cfg(tmp: Path) -> ActConfig:
     return ActConfig(
         rknn_model=str(tmp / "x.rknn"),
         manifest=str(tmp / "x.manifest.json"),
-        denorm_json=str(tmp / "denorm.json"),
-        action_dim=6,
-        state_dim=6,
-        chunk_size=100,
+        norm_stats_dir=str(tmp / "stats"),
+        action_dim=6, state_dim=6, chunk_size=100,
     )
 
 
 def test_missing_manifest_refuses_to_run() -> None:
     with _env.tmpdir() as d:
-        tmp = Path(d)
-        cfg = _cfg(tmp)
+        cfg = _cfg(Path(d))
         try:
             _bare(cfg)._load_manifest(cfg.manifest)
         except FileNotFoundError as e:
@@ -113,186 +169,120 @@ def test_manifest_missing_fields() -> None:
         raise AssertionError("manifest 缺字段应报错")
 
 
-def test_manifest_ok() -> None:
-    with _env.tmpdir() as d:
-        p = Path(d) / "m.json"
-        p.write_text(json.dumps({
-            "input_order": ["state", "front"],
-            "image_slots": ["front"],
-            "image_size": [480, 640],
-        }), encoding="utf-8")
-        m = ActRKNN._load_manifest(str(p))
-        assert m["input_order"] == ["state", "front"]
-
-
-def test_denorm_high_residual_warns(tmp_path_factory=None) -> None:
-    with _env.tmpdir() as d:
-        p = Path(d) / "d.json"
-        p.write_text(json.dumps({
-            "joints": list("abcdef"),
-            "scale": [1.0] * 6,
-            "offset": [0.0] * 6,
-            "fit_residual_max": 0.5,   # 偏大
-        }), encoding="utf-8")
-        scale, offset, joints = ActRKNN._load_denorm(str(p))  # 只应打警告
-        assert len(scale) == 6 and len(offset) == 6
-
-
-def test_validate_output_rejects() -> None:
-    cfg = _cfg(Path("."))
-    obj = _bare(cfg)
-
-    good = np.zeros((1, 100, 6), dtype=np.float32)
-    good[0, :, 0] = 0.5
-    obj._validate_output(good)  # 不应抛
-
-    cases = {
-        "非3维": np.zeros((100, 6), dtype=np.float32),
-        "batch!=1": np.zeros((2, 100, 6), dtype=np.float32),
-        "动作维度错": np.zeros((1, 100, 7), dtype=np.float32),
-        "含NaN": np.full((1, 100, 6), np.nan, dtype=np.float32),
-        "含Inf": np.full((1, 100, 6), np.inf, dtype=np.float32),
-        "全零": np.zeros((1, 100, 6), dtype=np.float32),
-    }
-    for name, arr in cases.items():
-        try:
-            obj._validate_output(arr)
-        except RuntimeError:
-            continue
-        raise AssertionError(f"应拒绝: {name}")
-
-
-def test_validate_output_allows_small_values() -> None:
-    """不能把"数值很小"误判成"全零失效"。"""
-    cfg = _cfg(Path("."))
-    obj = _bare(cfg)
-    a = np.full((1, 100, 6), 1e-6, dtype=np.float32)
-    obj._validate_output(a)
-
-
-def test_prep_image_shape_and_channel_order() -> None:
-    """用 cv2 桩验证形状/值域/通道顺序（BGR 输入 -> RGB 输出）。"""
-    cfg = _cfg(Path("."))
-    cfg.image_norm = "zero_one"
-    cfg.image_resize = "squash"
-    obj = _bare(cfg)
-    obj.image_size = (480, 640)
-
-    bgr = np.zeros((240, 320, 3), dtype=np.uint8)
-    bgr[:, :, 0] = 255  # 蓝色通道
-    out = obj._prep_image(bgr)
-    assert out.shape == (1, 3, 480, 640), out.shape
-    assert out.dtype == np.float32
-    assert out.min() >= 0.0 and out.max() <= 1.0 + 1e-6
-    # BGR -> RGB：原蓝色应落在第 3 个通道（索引 2）
-    assert out[0, 2].max() > 0.9, "蓝色通道没有落到 RGB 的 B 位（通道顺序错）"
-    assert out[0, 0].max() < 0.1, "红色通道不应有值"
-
-
-def test_prep_image_pad_mode_geometry() -> None:
-    """pad 模式：等比例缩放 + 补零，锚点必须可切换。
-
-    默认 top_left —— 与 IB_Robot 板端实测记录一致：
-        "480x640 -> 512x512 后顶部 128 行为零"
-    方向错了不会报错，只会让策略失效，所以这里把两种锚点都钉住。
-    """
-    cfg = _cfg(Path("."))
-    cfg.image_resize = "pad"
-
-    frame = np.full((480, 640, 3), 255, dtype=np.uint8)
-
-    # --- 锚点 top_left：内容靠右下，顶部 128 行为零 ---
-    cfg.image_pad_anchor = "top_left"
-    obj = _bare(cfg)
-    obj.image_size = (512, 512)
-    out = obj._prep_image(frame)
-    assert out.shape == (1, 3, 512, 512)
-    assert np.allclose(out[0, :, :128, :], 0.0), "top_left: 顶部 128 行应为零"
-    assert out[0, :, 128:, :].max() > 0.9, "top_left: 缩放后的图像内容丢失"
-
-    # --- 锚点 bottom_right：内容靠左上，底部 128 行为零 ---
-    cfg.image_pad_anchor = "bottom_right"
-    obj2 = _bare(cfg)
-    obj2.image_size = (512, 512)
-    out2 = obj2._prep_image(frame)
-    assert np.allclose(out2[0, :, 384:, :], 0.0), "bottom_right: 底部 128 行应为零"
-    assert out2[0, :, :384, :].max() > 0.9, "bottom_right: 缩放后的图像内容丢失"
-
-    # 两种锚点在垂直方向应是翻转关系
-    assert not np.allclose(out, out2), "两种锚点产生了相同结果，锚点参数没生效"
+def _full_setup(d: Path, layout: str = "nchw"):
+    stats_dir = _write_stats(d / "stats")
+    manifest = d / "m.json"
+    manifest.write_text(json.dumps({
+        "input_order": ["state", "front"],
+        "image_slots": ["front"],
+        "image_shapes": {"front": [1, 3, 4, 4]},
+        "image_size": [4, 4],
+        "image_layout": layout,
+        "output_shape": [1, 100, 6],
+    }), encoding="utf-8")
+    return ActConfig(
+        rknn_model=str(d / "fake.rknn"),
+        manifest=str(manifest),
+        norm_stats_dir=str(stats_dir),
+        action_dim=6, state_dim=6, chunk_size=100,
+    )
 
 
 def test_infer_passes_nchw_data_format() -> None:
-    """回归保护：rknn.inference 默认按 nhwc 解释输入，必须显式传 data_format='nchw'。
+    """回归保护：rknn.inference 默认按 nhwc 解释输入，必须显式传 data_format。
 
     实测报错（未传时）：
-        The input(ndarray) shape (1,3,480,640) is wrong,
-        expect 'nhwc' like (1,480,640,3)
+        The input(ndarray) shape (1,3,480,640) is wrong, expect 'nhwc' like (1,480,640,3)
     """
     from rknnlite.api import RKNNLite
 
     with _env.tmpdir() as d:
-        manifest = Path(d) / "m.json"
-        manifest.write_text(json.dumps({
-            "input_order": ["state", "front"],
-            "image_slots": ["front"],
-            "image_shapes": {"front": [1, 3, 480, 640]},
-            "image_size": [480, 640],
-            "image_layout": "nchw",
-            "output_shape": [1, 100, 6],
-        }), encoding="utf-8")
-        denorm = Path(d) / "denorm.json"
-        denorm.write_text(json.dumps({
-            "joints": list("abcdef"),
-            "scale": [100.0] * 6,
-            "offset": [2047.0] * 6,
-            "fit_residual_max": 0.0,
-        }), encoding="utf-8")
-
-        cfg = ActConfig(
-            rknn_model=str(Path(d) / "fake.rknn"),
-            manifest=str(manifest),
-            denorm_json=str(denorm),
-            action_dim=6, state_dim=6, chunk_size=100,
-        )
-        act = ActRKNN(cfg)
-        frame = np.zeros((480, 640, 3), dtype=np.uint8)
-        out = act.infer({"front": frame}, np.full(6, 2047.0, dtype=np.float32))
-
+        act = ActRKNN(_full_setup(Path(d)))
+        frame = np.zeros((4, 4, 3), dtype=np.uint8)
+        out = act.infer({"front": frame}, np.zeros(6, dtype=np.float32))
         assert RKNNLite.last_inference_kwargs.get("data_format") == "nchw", \
             f"必须以 nchw 调用，实际: {RKNNLite.last_inference_kwargs}"
         assert out.shape == (100, 6), out.shape
-        # 反归一化应生效：0.25 * 100 + 2047 = 2072
-        assert np.allclose(out[0], 2072.0, atol=1e-3), out[0]
 
 
 def test_manifest_rejects_non_nchw_layout() -> None:
-    """manifest 声明 nhwc 时应当直接拒绝，而不是悄悄转置。"""
     with _env.tmpdir() as d:
-        manifest = Path(d) / "m.json"
-        manifest.write_text(json.dumps({
-            "input_order": ["state", "front"],
-            "image_slots": ["front"],
-            "image_size": [480, 640],
-            "image_layout": "nhwc",
-        }), encoding="utf-8")
-        denorm = Path(d) / "denorm.json"
-        denorm.write_text(json.dumps({
-            "joints": list("abcdef"), "scale": [1.0] * 6, "offset": [0.0] * 6,
-        }), encoding="utf-8")
-        cfg = ActConfig(
-            rknn_model=str(Path(d) / "fake.rknn"),
-            manifest=str(manifest), denorm_json=str(denorm),
-            action_dim=6, state_dim=6, chunk_size=100,
-        )
-        act = ActRKNN(cfg)
         try:
-            act.infer({"front": np.zeros((480, 640, 3), dtype=np.uint8)},
-                      np.zeros(6, dtype=np.float32))
+            ActRKNN(_full_setup(Path(d), layout="nhwc"))
         except ValueError as e:
             assert "image_layout" in str(e)
             return
         raise AssertionError("nhwc layout 应被拒绝")
+
+
+def test_prep_image_does_not_swap_channels() -> None:
+    """LeRobot 的相机默认输出 RGB —— 板端**不能**再做 BGR->RGB 转换。
+
+    这里喂纯红 RGB，经过预处理后红色通道必须仍在索引 0。
+    通道反了不会报错，只会让策略完全失效。
+    """
+    with _env.tmpdir() as d:
+        act = ActRKNN(_full_setup(Path(d)))
+        # 归一化统计量里 front 的 mean/std 是各通道不同的，先归零以便判断
+        act.stats.cameras["front"] = (
+            np.zeros((3, 1, 1), dtype=np.float32), np.ones((3, 1, 1), dtype=np.float32)
+        )
+        red = np.zeros((4, 4, 3), dtype=np.uint8)
+        red[:, :, 0] = 255  # R=255, G=0, B=0
+        chw = act._prep_image(red, "front")
+        assert chw[0, 0].max() > 0.99, "红色通道丢失 —— 通道顺序错了"
+        assert chw[0, 1].max() < 1e-6 and chw[0, 2].max() < 1e-6, "绿/蓝通道不应有值"
+
+
+def test_prep_image_pad_anchor() -> None:
+    with _env.tmpdir() as d:
+        cfg = _full_setup(Path(d))
+        cfg.image_pad_anchor = "top_left"
+        act = ActRKNN(cfg)
+        act.image_size = (8, 8)
+        act.stats.cameras["front"] = (
+            np.zeros((3, 1, 1), dtype=np.float32), np.ones((3, 1, 1), dtype=np.float32)
+        )
+        frame = np.full((2, 8, 3), 255, dtype=np.uint8)  # 很扁的图
+        out = act._prep_image(frame, "front")
+        assert out.shape == (1, 3, 8, 8)
+        # 2x8 等比缩放到 2x8（不需缩放），top_left 应把内容放在底部
+        assert out[0, :, :6, :].max() < 1e-6, "top_left: 上部应为 padding"
+        assert out[0, :, 6:, :].max() > 0.9, "top_left: 内容应在底部"
+
+
+def test_validate_output_rejects() -> None:
+    with _env.tmpdir() as d:
+        obj = _bare(_full_setup(Path(d)))
+        good = np.zeros((1, 100, 6), dtype=np.float32)
+        good[0, :, 0] = 0.5
+        obj._validate_output(good)  # 不应抛
+
+        cases = {
+            "非3维": np.zeros((100, 6), dtype=np.float32),
+            "batch!=1": np.zeros((2, 100, 6), dtype=np.float32),
+            "动作维度错": np.zeros((1, 100, 7), dtype=np.float32),
+            "含NaN": np.full((1, 100, 6), np.nan, dtype=np.float32),
+            "含Inf": np.full((1, 100, 6), np.inf, dtype=np.float32),
+            "全零": np.zeros((1, 100, 6), dtype=np.float32),
+        }
+        for name, arr in cases.items():
+            try:
+                obj._validate_output(arr)
+            except RuntimeError:
+                continue
+            raise AssertionError(f"应拒绝: {name}")
+
+
+def test_infer_rejects_unknown_camera_slot() -> None:
+    with _env.tmpdir() as d:
+        act = ActRKNN(_full_setup(Path(d)))
+        try:
+            act.infer({}, np.zeros(6, dtype=np.float32))
+        except ValueError as e:
+            assert "front" in str(e)
+            return
+        raise AssertionError("缺少相机帧应报错")
 
 
 def main() -> int:
@@ -305,7 +295,7 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             failed += 1
             print(f"  FAIL  {t.__name__}: {type(e).__name__}: {e}")
-    print(f"配置 + ActRKNN 防护: {len(tests) - failed}/{len(tests)} 通过")
+    print(f"配置 + 归一化 + 防护: {len(tests) - failed}/{len(tests)} 通过")
     return failed
 
 
