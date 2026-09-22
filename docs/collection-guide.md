@@ -91,6 +91,14 @@ python scripts/calibrate_so101.py check --role follower --port $F
 python scripts/calibrate_so101.py check --role leader   --port $L
 ```
 
+> ⚠️ **扭矩警告（重要）**
+> `check` 是**纯只读**的，跑完保持扭矩状态不变——内部用的是
+> `disconnect(disable_torque=False)`。这一点**必须显式写**：因为
+> `MotorsBus.disconnect()` 的默认参数是 **`disable_torque=True`**，
+> 不覆盖的话从臂会被当场松掉扭矩、直接瘫下来。
+> 而 `calibrate` 会**主动 `disable_torque()`**：机械臂将失去支撑，
+> **请先用手扶住或垫好**，别让它砸下来。
+
 校准过程中（三个 `input()` 提示）：
 
 1. 若已有同名校准文件，会问「回车沿用 / 输入 `c` 重标」→ 首次都该输入 **`c`**

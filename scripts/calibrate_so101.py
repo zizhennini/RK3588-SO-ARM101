@@ -196,8 +196,11 @@ def cmd_check(args) -> int:
             print("       已有校准文件 → 若更换了机械臂或想重来，加 --force。")
         return 0
     finally:
+        # 关键：MotorsBus.disconnect() 的默认参数是 disable_torque=True，
+        # 会把扭矩关掉 → 上电保持姿态的从臂会当场瘫下来。
+        # 自检是纯只读操作，必须保持扭矩状态不变。
         try:
-            dev.bus.disconnect()
+            dev.bus.disconnect(disable_torque=False)
         except Exception:  # noqa: BLE001
             pass
 
@@ -214,6 +217,11 @@ def cmd_calibrate(args) -> int:
     print(f"校准 {args.role}   端口 {args.port}   ID {dev_id}")
     print(f"目标文件: {dev.calibration_fpath}")
     print("=" * 64)
+    print()
+    print("!! 扭矩警告 !!")
+    print("   校准过程会主动 disable_torque()：机械臂将失去支撑。")
+    print("   从臂请先用手扶住或垫好，别让它砸下来。")
+    print()
 
     if dev.calibration_fpath.exists() and not args.force:
         print("\n该 ID 已有校准文件。")
