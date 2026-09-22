@@ -37,6 +37,10 @@ dataclass 规则的不兼容，**与我们的 SO-101 毫无关系**，也永远�
     # 查看已保存的校准文件
     python scripts/calibrate_so101.py show --role follower
 
+    # 测量主从臂的校准偏移（把两个臂摆成同一物理姿态再测）
+    python scripts/calibrate_so101.py compare \
+        --follower-port /dev/ttyACM0 --leader-port /dev/ttyACM1
+
 注意：``--id`` 不传时会用默认值。**不要留空**，否则 LeRobot 会把校准文件
 存成 ``None.json``（我们之前清理时就见过这种残留文件）。
 
@@ -350,6 +354,115 @@ def cmd_show(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# compare：测量主从臂之间的校准偏移
+# --------------------------------------------------------------------------- #
+def cmd_compare(args) -> int:
+    calib_dir = resolve_calib_dir(args)
+    fid = args.follower_id or DEFAULT_IDS["follower"]
+    lid = args.leader_id or DEFAULT_IDS["leader"]
+
+    fol = build_device("follower", args.follower_port, fid, calib_dir)
+    lead = build_device("leader", args.leader_port, lid, calib_dir)
+
+    print("=" * 72)
+    print(f"follower  {args.follower_port}  id={fid}")
+    print(f"leader    {args.leader_port}  id={lid}")
+    print("=" * 72)
+
+    for name, dev in (("follower", fol), ("leader", lead)):
+        if not dev.calibration_fpath.exists():
+            print(f"[失败] {name} 还没有校准文件: {dev.calibration_fpath}")
+            return 2
+
+    # --- 先对比两者的校准行程（静态信息） ---
+    print()
+    print("已加载的校准行程（两个臂的 span 差得多 = 扫过的物理范围不一致）")
+    print(f"{'关节':<15}{'f_min':>7}{'f_max':>7}{'f_span':>8}  {'l_min':>7}{'l_max':>7}{'l_span':>8}  {'span差':>8}")
+    print("-" * 68)
+    for m in MOTORS:
+        fc, lc = fol.calibration.get(m), lead.calibration.get(m)
+        if fc is None or lc is None:
+            print(f"{m:<15}{'--':>7}{'--':>7}{'--':>8}  {'--':>7}{'--':>7}{'--':>8}  {'--':>8}")
+            continue
+        fs, ls = fc.range_max - fc.range_min, lc.range_max - lc.range_min
+        diff = (ls - fs) / fs * 100 if fs else 0.0
+        flag = "  <<<" if abs(diff) > 5 else ""
+        print(
+            f"{m:<15}{fc.range_min:>7}{fc.range_max:>7}{fs:>8}"
+            f"  {lc.range_min:>7}{lc.range_max:>7}{ls:>8}  {diff:>+7.1f}%{flag}"
+        )
+    print()
+    print("注：wrist_roll 的 range 是 LeRobot 硬编码的 0/4095，不是扫出来的。")
+    print("    它的零点 = 校准按 ENTER 那一刻的物理转角，两个臂必须转到位才一致。")
+
+    # --- 实机测量 ---
+    try:
+        fol.bus.connect()
+        lead.bus.connect()
+    except Exception as e:  # noqa: BLE001
+        print(f"\n[失败] 串口连接失败: {type(e).__name__}: {e}")
+        return 2
+
+    try:
+        # 两个臂都松扭矩，方便用手摆到同一个物理姿态
+        print()
+        print("!! 注意：下面会把**两个臂都松开扭矩**，机械臂将失去支撑。")
+        print("   请先扶住从臂，再把两个臂摆成同一个物理姿态。")
+        fol.bus.disable_torque()
+        lead.bus.disable_torque()
+
+        while True:
+            print()
+            input("把两个臂摆成完全相同的物理姿态（每个关节角度都一致），然后回车测量...")
+            f_norm = fol.bus.sync_read("Present_Position")
+            l_norm = lead.bus.sync_read("Present_Position")
+
+            print()
+            print(f"{'关节':<15}{'follower':>11}{'leader':>11}{'差值':>11}  判定")
+            print("-" * 58)
+            worst_joint, worst = None, 0.0
+            for m in MOTORS:
+                fv, lv = f_norm.get(m), l_norm.get(m)
+                if fv is None or lv is None:
+                    print(f"{m:<15}{'--':>11}{'--':>11}{'--':>11}  缺失")
+                    continue
+                d = lv - fv
+                if m == "gripper":
+                    note = "(0-100 量程)"
+                else:
+                    if abs(d) > worst:
+                        worst, worst_joint = abs(d), m
+                    note = "OK" if abs(d) <= 3 else ("有偏移" if abs(d) <= 10 else "<<< 偏移偏大")
+                print(f"{m:<15}{fv:>11.2f}{lv:>11.2f}{d:>+11.2f}  {note}")
+
+            print()
+            if worst <= 3:
+                print(f"[结论] 最大关节偏差 {worst:.2f} deg —— 校准一致，可以采数据。")
+            elif worst <= 10:
+                print(
+                    f"[结论] 最大关节偏差 {worst:.2f} deg（{worst_joint}）"
+                    " —— 能跑，但姿态有可见偏差。"
+                )
+            else:
+                print(
+                    f"[结论] 最大关节偏差 {worst:.2f} deg（{worst_joint}）—— 建议重标定：\n"
+                    "       把两个臂摆成同一个姿态，然后对两个臂各跑一次\n"
+                    "       `calibrate --force`，并且**每个关节都扫到物理极限**。"
+                )
+
+            if input("\n回车 = 再测一次，q = 退出: ").strip().lower() == "q":
+                break
+    finally:
+        # 保持松扭矩状态断开，别让机械臂突然绷紧
+        for dev in (fol, lead):
+            try:
+                dev.bus.disconnect(disable_torque=False)
+            except Exception:  # noqa: BLE001
+                pass
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="SO-101 校准/自检（绕开 lerobot-calibrate 的依赖沼泽）",
@@ -385,6 +498,15 @@ def main(argv=None) -> int:
     p_show = sub.add_parser("show", help="查看已保存的校准文件")
     add_common(p_show, need_port=False)
     p_show.set_defaults(func=cmd_show)
+
+    p_cmp = sub.add_parser("compare", help="测量主从臂之间的校准偏移（两臂同时连）")
+    p_cmp.add_argument("--follower-port", required=True, help="从臂串口")
+    p_cmp.add_argument("--leader-port", required=True, help="主臂串口")
+    p_cmp.add_argument("--follower-id", default=None, help=f"默认 {DEFAULT_IDS['follower']}")
+    p_cmp.add_argument("--leader-id", default=None, help=f"默认 {DEFAULT_IDS['leader']}")
+    p_cmp.add_argument("--calibration-dir", default=None,
+                       help=f"校准文件根目录，默认 {DEFAULT_CALIB_DIR}")
+    p_cmp.set_defaults(func=cmd_compare)
 
     args = ap.parse_args(argv)
     return args.func(args)

@@ -122,6 +122,45 @@ python scripts/calibrate_so101.py check --role leader   --port $L
 时**必须显式传** `--robot.calibration_dir` 和 `--teleop.calibration_dir`，
 否则它找不到文件、会**重新触发一次校准**（下面 §3/§4 的命令里已经带了）。
 
+### ⚠️ `wrist_roll` 的零点很特殊（必须知道）
+
+5 个身体关节和 `wrist_roll` 的处理**根本不同**。`so_follower.py` / `so_leader.py`
+里都是这么写的：
+
+```python
+full_turn_motor = "wrist_roll"
+unknown_range_motors = [m for m in self.bus.motors if m != full_turn_motor]
+range_mins, range_maxes = self.bus.record_ranges_of_motion(unknown_range_motors)
+range_mins[full_turn_motor] = 0        # ← 硬编码，不是扫出来的
+range_maxes[full_turn_motor] = 4095
+```
+
+而归一化公式是（`motors_bus.py:_normalize`）：
+
+```
+norm = (clamp(val, min, max) - min) / (max - min) * 200 - 100
+val  = 物理编码器读数 + homing_offset
+```
+
+- **5 个身体关节**：`range_min/max` 是在设完 homing **之后**扫出来的，
+  代入上式后 `homing_offset` **完全约掉** → 映射只由「扫过的物理行程」决定。
+  **「按 ENTER 时摆的中间位姿」其实不影响结果**，别在那一动作上纠结。
+- **`wrist_roll`**：分母是常数 `4095`，`homing_offset` **约不掉**
+  → **按 ENTER 那一刻的物理转角就是它的零点**。
+
+所以 `wrist_roll` 是唯一一个「两个臂必须转到**同一个物理角度**再按 ENTER」的关节。
+官方 issue [#3193](https://github.com/huggingface/lerobot/issues/3193) 讲的就是这件事，
+维护者原话：
+
+> The position of the wrist motor you start the calibration with will be the "0",
+> so make sure that they are quite well aligned.
+
+两个臂的 `wrist_roll` 零点没对齐 → 遥操作时手腕有**恒定角度错位**，
+典型表现是「转到一半突然跳一下」或者顶到机械限位。
+
+**重标定时的正确做法**：先把两个臂摆成**同一个姿态**
+（`wrist_roll` 的夹爪朝向也要一致），再分别跑 `calibrate --force`。
+
 ### 旧校准文件的处置
 
 板上前作留下了**两份从臂校准文件，数值不一样**：
@@ -172,6 +211,25 @@ lerobot-teleoperate \
 - 如果这时它**要求重新校准**，说明 `--robot.calibration_dir` / `--teleop.calibration_dir`
   没生效（路径写错，或 §2 的校准文件不存在）——**别顺手就重标**，先查路径
 - `--robot.id` / `--teleop.id` 必须和校准时的 id 一致，否则又回到"加载错文件"的老坑
+
+### 觉得姿态有偏差时：用 `compare` 量，不要靠眼睛
+
+「主臂比从臂高了一点」这类观感**无法自查**，直接量：
+
+```bash
+python scripts/calibrate_so101.py compare \
+  --follower-port /dev/ttyACM0 --leader-port /dev/ttyACM1
+```
+
+它会：
+
+1. 先打印两个臂的**校准行程对比**（`span` 差得多 = 扫过的物理范围不一致，
+   这是身体关节偏移的**唯一**来源）
+2. 把两个臂**都松开扭矩**，让你把它们摆成同一个物理姿态，回车
+3. 逐关节打印 `follower` / `leader` / **差值**，并给出结论
+
+判定标准：身体关节偏差 **≤3° 算一致**，>10° 建议重标定。
+`gripper` 是 0–100 量程，不参与角度判定。
 
 ---
 
