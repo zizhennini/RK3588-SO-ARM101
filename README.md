@@ -147,8 +147,10 @@ python tests/run_all.py
 **工具链已端到端跑通**（WSL2 的 `rknn` 环境，用真实 ACT 架构的随机策略）：
 ONNX → RKNN（含 LayerNorm 融合规则自动回退）→ 输入顺序暴力确认 → manifest。
 
-**尚未验证**：真实串口收发、真实 NPU 推理数值、真实训练产物。
-这些都必须有硬件才能验收。
+**尚未验证**：真实训练产物（无数据）；真实 NPU 上跑 ACT 模型（无微调产物）。
+**已实测通过**：板子 NPU（resnet18 8.28ms）、D435i 取流（640×480@30 满帧）、
+机械臂串口（ID 1~6 全部应答）、`SOFollower` 构造。
+详见 [`docs/board-setup.md`](docs/board-setup.md)。
 
 ## 工具链实测发现（都是真跑出来的）
 
@@ -164,5 +166,9 @@ ONNX → RKNN（含 LayerNorm 融合规则自动回退）→ 输入顺序暴力�
 | T8 | 通道顺序 | LeRobot 相机默认输出 **RGB**，板端不能再做 BGR→RGB（会反相） |
 | T9 | torchvision 下载权重卡死 | 数据传完但连接不收尾，`.partial` 永不转正 → 用 curl 预置权重 |
 | T10 | `huggingface.co` 不可达 | `hf-mirror.com` 可用 → 设 `HF_ENDPOINT` |
+| T11 | `data_format='nchw'` 的准确语义 | 板端实测：RKNN 会**自动转换并给警告**（`need NHWC ... will be changed to NHWC`），结果正确但多一次内部转换 → 更优是板端直接产出 NHWC |
+| T12 | 板端 `import lerobot.robots.so_follower` 失败 | `lerobot.processor` 为**一个类型别名**拉进 `transformers` 整条重依赖链，链上任何破损都会断掉机械臂控制（本次元凶是 `~/.local` 里 torch 版本不匹配的 torchaudio）→ `pip uninstall -y torchaudio` |
+| T13 | **D435i 在 RK3588 上开箱可用** | **修正此前的错误判断**：该板 `CONFIG_USB_VIDEO_CLASS=y`（uvcvideo builtin），`pyrealsense2 2.58.2` 直接枚举，彩色/深度/双流全 640×480@30 满帧，**不需要 libuvc 编译** |
 
-详见 `docs/act-pipeline.md`。
+板端环境的完整实录见 [`docs/board-setup.md`](docs/board-setup.md)：
+板子身份、NPU/相机/机械臂实测数据、清理记录、5 个踩坑对策。
