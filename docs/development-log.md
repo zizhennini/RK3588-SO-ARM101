@@ -220,6 +220,154 @@ rknn env  conda env `rkvla`：Python 3.10.20 + torch 2.12.1 + lerobot 0.4.4
 
 ---
 
+## [2026-09-22] [阶段四·续] 板端 CLI 全线复活 + 自研校准工具
+
+### 起点：三个 CLI 全部启动即崩
+
+主臂接上、准备开始校准，`lerobot-calibrate` 失败。最初按"缺依赖"处理，
+装了 `gymnasium` / `imageio` / `diffusers` 之后仍然失败，报错换成了
+`huggingface-hub>=1.5.0,<2.0 is required ... but found 0.35.3`。
+
+——装 `diffusers` 时把 `huggingface-hub` 从 1.20.1 降到 0.35.3，**把
+`~/.local` 的 transformers 弄坏了**。这是一次典型的"打地鼠"，继续装包只会更糟。
+
+**停下来做根因分析**，而不是接着装包。这是本次唯一的正确决定。
+
+### 根因（两层，缺一不可）
+
+**第一层：`~/.local` 在 `sys.path` 里排在 conda 环境前面**
+
+```
+1. .../rkvla/lib/python3.10.zip
+2. .../rkvla/lib/python3.10
+3. .../rkvla/lib/python3.10/lib-dynload
+4. /home/elf/.local/lib/python3.10/site-packages   ← 用户级，抢先命中
+5. .../rkvla/lib/python3.10/site-packages          ← conda 环境，被遮蔽
+```
+
+于是 `import transformers` **永远**拿到 `~/.local` 那份，而 env 里压根没有
+transformers（`PYTHONNOUSERSITE=1` 时是 MISSING）。**装包永远修不好**：
+装的都进 env，生效的始终是 `~/.local`。
+
+**第二层：`~/.local` 的 transformers 5.12.1 超出 lerobot 0.4.4 的约束**
+
+LeRobot 0.4.4 的 METADATA 白纸黑字：
+
+```
+Requires-Dist: transformers<5.0.0,>=4.57.1; extra == "transformers-dep"
+```
+
+而 transformers 5.x 把 `PretrainedConfig` 变成了 **kw_only dataclass**
+（实测 `dataclasses.is_dataclass(PretrainedConfig) == True`）。
+`lerobot/policies/groot/groot_n1.py:179` 是
+`backbone_cfg: dict = field(init=False, ...)`，Python 3.10 的
+`dataclasses._init_fn` 在 kw_only 分支上直接抛：
+
+```
+TypeError: non-default argument 'backbone_cfg' follows default argument
+```
+
+**报错链**（跟 SO-101 毫无关系，纯属 CLI 的 eager import 连坐）：
+
+```
+lerobot_{calibrate,record}.py 顶层 import 全部机器人类型
+  → lerobot.robots.unitree_g1
+  → lerobot.envs.factory
+  → lerobot.policies.__init__        # 又是 eager import 全部策略
+  → lerobot.policies.groot.groot_n1
+  → TypeError
+```
+
+实测：`lerobot-calibrate` 和 `lerobot-record` 都是这个错，
+`lerobot-teleoperate` 先卡在 `No module named 'rerun'`（同一个坑的前一站）。
+
+### 修复
+
+```bash
+RK=/home/elf/work/miniconda/envs/rkvla
+export PYTHONNOUSERSITE=1
+$RK/bin/python -m pip install --no-cache-dir \
+    "transformers>=4.57.1,<5.0.0" "huggingface-hub>=0.34.2,<0.36.0" \
+    "tokenizers>=0.22.0,<=0.23.0" \
+    "av>=15.0.0,<16.0.0" "datasets>=4.0.0,<5.0.0" \
+    "draccus==0.10.0" "rerun-sdk>=0.24.0,<0.27.0" regex safetensors
+
+mkdir -p $RK/etc/conda/activate.d
+echo 'export PYTHONNOUSERSITE=1' > $RK/etc/conda/activate.d/zz_disable_usersite.sh
+```
+
+三个坑中坑：
+
+1. **pip 会被 `~/.local` 骗** —— 不带 `PYTHONNOUSERSITE=1` 时 pip 认为
+   `regex` / `tokenizers` "already satisfied"（其实是在 `~/.local` 里），不装进 env。
+2. **`tokenizers` 不能装最新版** —— transformers 4.57.6 要求 `<=0.23.0`，
+   直接 `pip install tokenizers` 拿到 0.23.2 → transformers 导入期就 `ImportError`。
+   必须锁区间。
+3. **`draccus` 的 `__version__` 是 `0.8.0` 但 dist 版本是 `0.10.0`**
+   （包内属性忘了更新）—— 差点被这个假象带偏，要去查 `importlib.metadata.version`。
+
+### 结果
+
+| CLI | 修复前 | 修复后 |
+|---|---|---|
+| `lerobot-calibrate` | ❌ groot TypeError | ✅ rc=0 |
+| `lerobot-teleoperate` | ❌ `No module named 'rerun'` | ✅ rc=0 |
+| `lerobot-record` | ❌ groot TypeError | ✅ rc=0 |
+
+**整套官方 CLI 复活 → 不需要自己重写 record/teleop**，原计划不用大改。
+顺带确认了两个类型名：`--robot.type` 里有 `so101_follower`，
+`--teleop.type` 里有 `so101_leader`（之前文档里还标着"待核对"）。
+
+### 自研校准工具 `scripts/calibrate_so101.py`
+
+排查期间（CLI 还没修好时）写了这个工具；修好后**仍然保留**，因为它更合适：
+
+- 只 import `so_follower` / `so_leader` 两个模块，不碰 `unitree_g1`
+  → 不会被别人的 eager import 连坐
+- **校准文件写在仓库内** `configs/calibration/<id>.json`，跟随版本控制，
+  彻底摆脱 HF 缓存里 `None.json` / `my_awesome_*.json` 的静默劫持
+- 自带 `check` 子命令（只读，不写任何数据）先确认六个舵机应答
+
+```
+ports      列出 /dev/serial/by-id，并标注哪个是从臂哪个是主臂
+check      只读自检（sync_read Present_Position，normalize=False）
+calibrate  交互式校准（--force 可跳过"沿用旧文件"询问直接重标）
+show       查看已保存的校准文件
+```
+
+写的时候踩到两个真 bug，都值得记：
+
+1. **`Robot.__init__` 的 `calibration_dir` 语义**：
+   `calibration_dir = config.calibration_dir or <HF缓存>/robots/<name>`。
+   **显式传 `calibration_dir` 时不会再拼 `robots/so_follower/` 子目录**，
+   文件就是 `<dir>/<id>.json`。第一版的路径推导因此是错的，
+   已改为一律用实例的 `calibration_fpath` 权威路径。
+2. **未校准时 `sync_read("Present_Position")` 会失败**：它的默认参数是
+   `normalize=True`，会去查校准表做归一化，而那时校准表是空的。
+   必须显式 `normalize=False`（顺便说，`range_min/max`、`homing_offset`
+   本来就是**原始值**，读原始值才是对的）。
+
+另外确认 `display_data` 在两个 CLI 里**默认都是 `False`**，
+SSH 无显示器环境下保持默认即可（`rerun` 只是顶层 import，已装 0.26.2）。
+
+### 硬件现状（两臂都已接上并确认）
+
+| 设备 | 节点 | by-id 序列号 |
+|---|---|---|
+| 从臂 follower | `/dev/ttyACM0` | `usb-1a86_USB_Single_Serial_5B41532950-if00` |
+| 主臂 leader | `/dev/ttyACM1` | `usb-1a86_USB_Single_Serial_5AAF262805-if00` |
+| D435i | `/dev/video21` | ASIC 序列号 `254322076620` |
+
+（`ttyACM0/1` 会随插拔顺序变化，序列号不会。）
+
+**产出沉淀**：`docs/board-setup.md` 新增 **B6 详解**；
+`docs/collection-guide.md` §2/§3/§4 改用新工具与新校准路径；
+新增 `scripts/calibrate_so101.py`
+
+**下一步**：`check` 自检两臂 → 正式校准 → `lerobot-teleoperate` 验证跟随 → 试录 1 集。
+
+---
+
 ## 当前状态汇总（截至 2026-09-22）
 
 ### 已验证 ✅
@@ -232,13 +380,17 @@ rknn env  conda env `rkvla`：Python 3.10.20 + torch 2.12.1 + lerobot 0.4.4
 | RKNN 工具链 | 假 ACT 端到端，`verified_max_abs_diff = 6.88e-4` |
 | 板端 NPU | resnet18 **8.28 ms** |
 | 板端 D435i | 彩色/深度/双流 **640×480@30 满帧** |
-| 板端机械臂 | `/dev/ttyACM0 @1M`，**ID 1~6 全应答** |
+| 板端机械臂 | **两臂均已识别**：`ttyACM0`=follower / `ttyACM1`=leader，1 Mbaud，ID 1~6 全应答 |
 | `SOFollower` | 构造成功，features 与 `main.py` 一致 |
+| **板端 3 个 CLI** | **calibrate / teleoperate / record 全部 rc=0**（B6 修复后） |
+| **校准工具** | `scripts/calibrate_so101.py` 四个子命令全部跑通（非硬件路径） |
 
 ### 未验证 ⬜
 
 | 项 | 阻塞原因 |
 |---|---|
+| 板端两臂校准 | 未开始（命令已就绪，等你操作机械臂） |
+| 遥操作跟随 | 待校准完成 |
 | 真实 ACT 的导出→转换链路 | 无微调产物；且需 PC 侧 WSL 提权 |
 | 板端真实 NPU 跑 ACT 模型 | 同上 |
 | 真实数据采集与微调 | 待开始 |
@@ -246,6 +398,14 @@ rknn env  conda env `rkvla`：Python 3.10.20 + torch 2.12.1 + lerobot 0.4.4
 
 ### 待处理的现实问题
 
-1. **板子离线**（`10.1.27.9:22` 不通）—— 需检查 WiFi / 电源。
-2. 训练需要把数据集从板子/PC 之间搬运；`huggingface.co` 不可达，用 `HF_ENDPOINT=https://hf-mirror.com`。
-3. 板子内存只有 **7.7 GiB**（方案写 16GB），别在板上跑训练。
+1. **`~/.local` 仍是颗定时炸弹** —— 里面还留着越权包（如 torchaudio）。
+   env 已用 `PYTHONNOUSERSITE=1` 隔离（conda 激活时自动生效），
+   但**用裸 `python` 绕过 conda 激活时仍会中招**。排查任何导入怪问题时，
+   第一件事是确认这个变量在不在。
+2. `board` 是 WiFi 连接，SSH 会**间歇性超时/断连**（实测约 40% 的尝试会失败）
+   —— 所有远程 scp/ssh 操作都要带重试。
+3. 训练需要把数据集在板子/PC 之间搬运；`huggingface.co` 不可达，
+   用 `HF_ENDPOINT=https://hf-mirror.com`。
+4. 板子内存只有 **7.7 GiB**（方案写 16GB），别在板上跑训练。
+5. 板端 `torchvision 0.27.1` / `diffusers 0.40.0` 等超出 lerobot 0.4.4 约束，
+   属于**已知噪音**（板端只做 RKNN 推理，不碰这些路径），先不动。

@@ -2,7 +2,8 @@
 
 板端环境：`conda activate rkvla`（或直接用 `/home/elf/work/miniconda/envs/rkvla/bin/python`）
 项目路径：`/home/elf/work/rkrobot`
-硬件：从臂 `/dev/ttyACM0`、主臂（待接）、D435i `/dev/video21`
+硬件：从臂 `/dev/ttyACM0`、主臂 `/dev/ttyACM1`、D435i `/dev/video21`
+（都用 by-id 更稳，序列号见 §1）
 
 ---
 
@@ -32,14 +33,15 @@
 
 ## 1 · 接线
 
-| 设备 | 接口 | 预期节点 |
-|---|---|---|
-| 从臂（follower） | USB 2.0 | `/dev/ttyACM0` |
-| 主臂（leader） | USB 2.0 | `/dev/ttyACM1`（第二个接入的） |
-| D435i | **USB 3.0** | `/dev/video21`~`/dev/video26` |
+| 设备 | 接口 | 预期节点 | by-id 序列号 |
+|---|---|---|---|
+| 从臂（follower） | USB 2.0 | `/dev/ttyACM0` | `..._5B41532950-if00` |
+| 主臂（leader） | USB 2.0 | `/dev/ttyACM1` | `..._5AAF262805-if00` |
+| D435i | **USB 3.0** | `/dev/video21`~`/dev/video26` | ASIC `254322076620` |
 
 > ⚠️ D435i 必须插 USB3.0 口（蓝色），否则帧率砍半。
 > ⚠️ 两个臂**必须分别确认端口**，不要靠猜——用 `ls /dev/serial/by-id/` 看序列号。
+> ⚠️ **ttyACM0/1 会随插拔顺序变化**，序列号不会。要稳就用 by-id 全路径。
 
 ```bash
 ls -la /dev/serial/by-id/
@@ -51,7 +53,68 @@ ls -la /dev/serial/by-id/
 
 ## 2 · 校准（必须重做，且 id 必须唯一）
 
-### 为什么必须重做
+### 命令
+
+**不再用 `lerobot-calibrate`，用仓库自带的 `scripts/calibrate_so101.py`。**
+
+原因见 `board-setup.md` B6：官方 CLI 在这块板子上会因为
+`~/.local` 的 transformers 5.12.1 而整条挂掉。那个问题已经修好了，
+但我们的工具仍然更合适——**它把校准文件写在仓库内的固定路径**，
+不会被 HF 缓存里的 `None.json` / `my_awesome_*.json` 静默劫持。
+
+```bash
+source /home/elf/work/miniconda/bin/activate rkvla
+cd /home/elf/work/rkrobot
+
+# 0) 先看串口，确认 by-id 对得上（防止 ttyACM0/1 换序）
+python scripts/calibrate_so101.py ports
+
+# 1) 只读自检：六个舵机是否全部应答（不写任何数据）
+python scripts/calibrate_so101.py check --role follower --port /dev/ttyACM0
+python scripts/calibrate_so101.py check --role leader   --port /dev/ttyACM1
+
+# 2) 正式校准（交互式，按提示摆臂）
+python scripts/calibrate_so101.py calibrate --role follower --port /dev/ttyACM0
+python scripts/calibrate_so101.py calibrate --role leader   --port /dev/ttyACM1
+
+# 3) 确认结果
+python scripts/calibrate_so101.py show --role follower
+python scripts/calibrate_so101.py show --role leader
+```
+
+习惯用 by-id 全路径也可以（更稳，不受插拔顺序影响）：
+
+```bash
+F=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B41532950-if00   # follower
+L=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AAF262805-if00   # leader
+python scripts/calibrate_so101.py check --role follower --port $F
+python scripts/calibrate_so101.py check --role leader   --port $L
+```
+
+校准过程中（三个 `input()` 提示）：
+
+1. 若已有同名校准文件，会问「回车沿用 / 输入 `c` 重标」→ 首次都该输入 **`c`**
+   （或直接加 `--force` 跳过这个询问）
+2. `把机械臂摆到各关节行程的中间位置` → **这是 homing offset 的来源，摆不准后面全偏**
+3. `把除 wrist_roll 外的每个关节手动转完整个行程` → 慢慢转到底再转到底
+
+> `wrist_roll` 会被**跳过**（LeRobot 硬编码 0–4095）。
+> 主臂校准前记得**扭矩是断开的**（`configure()` 会 `disable_torque()`），可以直接手拖。
+
+**校准文件落点**（`--id` 默认 `so101_follower` / `so101_leader`）：
+
+```
+/home/elf/work/rkrobot/configs/calibration/so101_follower.json
+/home/elf/work/rkrobot/configs/calibration/so101_leader.json
+```
+
+**这不是 LeRobot 的默认位置**（默认在
+`~/.cache/huggingface/lerobot/calibration/robots/so_follower/<id>.json`）。
+好处是跟随仓库、可版本化；代价是后面用 `lerobot-teleoperate` / `lerobot-record`
+时**必须显式传** `--robot.calibration_dir` 和 `--teleop.calibration_dir`，
+否则它找不到文件、会**重新触发一次校准**（下面 §3/§4 的命令里已经带了）。
+
+### 旧校准文件的处置
 
 板上前作留下了**两份从臂校准文件，数值不一样**：
 
@@ -64,76 +127,62 @@ ls -la /dev/serial/by-id/
 | wrist_roll | -1514 | **-1458** |
 | gripper | 1781 | 1779 |
 
-**用哪一份由 `--robot.id` 决定**（不传 id 就用 `None.json`）。
+用哪一份由 `--robot.id` 决定（不传 id 就用 `None.json`）。
 采数据用一份、部署用另一份 → **所有动作整体偏，且不报任何错**。
 
-→ 所以：**重新校准，用全新的 id**，把旧的歧义彻底排除。
-
-### 命令
-
-```bash
-source /home/elf/work/miniconda/bin/activate rkvla
-
-# 从臂（id 用 rkrobot_follower）
-lerobot-calibrate \
-  --robot.type=so101_follower \
-  --robot.port=/dev/ttyACM0 \
-  --robot.id=rkrobot_follower
-
-# 主臂（id 用 rkrobot_leader）
-lerobot-calibrate \
-  --teleop.type=so101_leader \
-  --teleop.port=/dev/ttyACM1 \
-  --teleop.id=rkrobot_leader
-```
-
-> `so101_leader` 这个类型名请在 0.4.4 里核对一下（目录名是 `so_leader`，
-> 注册名可能是 `so101_leader` / `so100_leader`）：
-> ```bash
-> python -c "from lerobot.teleoperators.utils import TeleopConfig; print(TeleopConfig.get_choice_class_names())"
-> ```
-> 或者直接看 `lerobot-record --help` 里 `--teleop.type` 的可选值。
-
-校准过程中：
-- 先**手动把两个臂摆到同一个中间姿态**（这一步决定了 homing offset，摆不准后面全偏）
-- `wrist_roll` 关节会被**跳过**（LeRobot 硬编码 0–4095）
-- 校准结果写到 `~/.cache/huggingface/lerobot/calibration/{robots,teleoperators}/so*_*/<id>.json`
-
-**校准完立即确认只有你新建的那份 id**：
+因为我们把校准写进**仓库内的独立目录**，这些文件**根本不会被读到**，
+歧义自动消失。不用特意去删它们——确认一下它们不在 `configs/calibration/` 里就行：
 
 ```bash
-find ~/.cache/huggingface/lerobot/calibration -name '*.json' -printf '  %p\n'
+find /home/elf/work/rkrobot/configs/calibration -name '*.json'
 ```
 
-建议把旧的 `None.json` 和 `my_awesome_*.json` **移走备份**（不要留在原地），
-免得后面忘记传 id 时静默加载了错的那份。
+应该只有你刚生成的 `so101_follower.json` 和 `so101_leader.json`。
 
 ---
 
 ## 3 · 遥操作验证（先不录数据）
 
 ```bash
+source /home/elf/work/miniconda/bin/activate rkvla
+CAL=/home/elf/work/rkrobot/configs/calibration
+
 lerobot-teleoperate \
-  --robot.type=so101_follower --robot.port=/dev/ttyACM0 --robot.id=rkrobot_follower \
-  --teleop.type=so101_leader --teleop.port=/dev/ttyACM1 --teleop.id=rkrobot_leader
+  --robot.type=so101_follower  --robot.port=/dev/ttyACM0  --robot.id=so101_follower \
+  --robot.calibration_dir=$CAL \
+  --teleop.type=so101_leader   --teleop.port=/dev/ttyACM1 --teleop.id=so101_leader \
+  --teleop.calibration_dir=$CAL \
+  --fps=60
 ```
 
 **验收标准**：动主臂，从臂应实时跟随，无明显延迟、不抖动、方向正确。
 **这一步不过就别录数据。**
+
+要点：
+- `--display_data` 默认就是 `False`，**SSH 无显示器环境下保持默认**
+  （设 `true` 会尝试开 rerun 窗口，无 X11 会失败）
+- 如果这时它**要求重新校准**，说明 `--robot.calibration_dir` / `--teleop.calibration_dir`
+  没生效（路径写错，或 §2 的校准文件不存在）——**别顺手就重标**，先查路径
+- `--robot.id` / `--teleop.id` 必须和校准时的 id 一致，否则又回到"加载错文件"的老坑
 
 ---
 
 ## 4 · 试录 1 集（冒烟测试）
 
 ```bash
+source /home/elf/work/miniconda/bin/activate rkvla
+CAL=/home/elf/work/rkrobot/configs/calibration
+
 lerobot-record \
   --robot.type=so101_follower \
   --robot.port=/dev/ttyACM0 \
-  --robot.id=rkrobot_follower \
+  --robot.id=so101_follower \
+  --robot.calibration_dir=$CAL \
   --robot.cameras="{ front: {type: opencv, index_or_path: /dev/video21, width: 640, height: 480, fps: 30} }" \
   --teleop.type=so101_leader \
   --teleop.port=/dev/ttyACM1 \
-  --teleop.id=rkrobot_leader \
+  --teleop.id=so101_leader \
+  --teleop.calibration_dir=$CAL \
   --dataset.repo_id=local/so101-pen-place \
   --dataset.root=/media/elf/ROOT/datasets/so101-pen-place \
   --dataset.num_episodes=1 \

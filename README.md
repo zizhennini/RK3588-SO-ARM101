@@ -167,8 +167,9 @@ ONNX → RKNN（含 LayerNorm 融合规则自动回退）→ 输入顺序暴力�
 | T9 | torchvision 下载权重卡死 | 数据传完但连接不收尾，`.partial` 永不转正 → 用 curl 预置权重 |
 | T10 | `huggingface.co` 不可达 | `hf-mirror.com` 可用 → 设 `HF_ENDPOINT` |
 | T11 | `data_format='nchw'` 的准确语义 | 板端实测：RKNN 会**自动转换并给警告**（`need NHWC ... will be changed to NHWC`），结果正确但多一次内部转换 → 更优是板端直接产出 NHWC |
-| T12 | 板端 `import lerobot.robots.so_follower` 失败 | `lerobot.processor` 为**一个类型别名**拉进 `transformers` 整条重依赖链，链上任何破损都会断掉机械臂控制（本次元凶是 `~/.local` 里 torch 版本不匹配的 torchaudio）→ `pip uninstall -y torchaudio` |
+| T12 | 板端 `import lerobot.robots.so_follower` 失败 | `lerobot.processor` 为**一个类型别名**拉进 `transformers` 整条重依赖链，链上任何破损都会断掉机械臂控制（本次元凶是 `~/.local` 里 torch 版本不匹配的 torchaudio）→ `pip uninstall -y torchaudio`（同一个依赖链后来**又以 T14 的形式复发**，真正的总根因是 `~/.local` 越权，见 T14） |
 | T13 | **D435i 在 RK3588 上开箱可用** | **修正此前的错误判断**：该板 `CONFIG_USB_VIDEO_CLASS=y`（uvcvideo builtin），`pyrealsense2 2.58.2` 直接枚举，彩色/深度/双流全 640×480@30 满帧，**不需要 libuvc 编译** |
+| T14 | **三个 lerobot CLI 全部启动即崩**：`TypeError: non-default argument 'backbone_cfg' follows default argument` | `~/.local/lib/python3.10/site-packages` 在 `sys.path` 里**排在 conda 环境前面**，且其中的 `transformers 5.12.1` **超出** lerobot 0.4.4 的 `transformers<5.0.0` 约束；transformers 5.x 把 `PretrainedConfig` 变成 **kw_only dataclass**，踩中 Python 3.10 的 dataclass 规则。因为 env 里根本没有 transformers，**装包永远修不好**（装的进 env，生效的是 `~/.local`）→ 装合规版本进 env + 永久 `PYTHONNOUSERSITE=1`，详见 `docs/board-setup.md` **B6** |
 
 板端环境的完整实录见 [`docs/board-setup.md`](docs/board-setup.md)：
 板子身份、NPU/相机/机械臂实测数据、清理记录、5 个踩坑对策。

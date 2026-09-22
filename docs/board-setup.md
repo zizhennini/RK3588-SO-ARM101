@@ -88,12 +88,25 @@ pkt = bytes([0xFF, 0xFF, *body, (~sum(body)) & 0xFF])
 板端统一用 **conda env `rkvla`**（`/home/elf/work/miniconda/envs/rkvla`）：
 
 ```
-Python 3.10.20    torch 2.12.1+cpu   torchvision 0.27.1+cpu
-lerobot 0.4.4     numpy 2.2.6        cv2 4.13.0
+Python 3.10.20    torch 2.12.1+cpu    torchvision 0.27.1+cpu
+lerobot 0.4.4     numpy 2.2.6         cv2 4.13.0
 rknnlite          pyrealsense2 2.58.2
 ```
 
+**2026-09-22 修复后补齐**（原由 `~/.local` 越权提供，见下面 B6）：
+
+```
+transformers 4.57.6   tokenizers 0.22.2   huggingface_hub 0.35.3
+draccus 0.10.0        rerun-sdk 0.26.2    av 15.1.0
+datasets 4.8.5        regex / safetensors
+```
+
 `lerobot` 是从 `/home/elf/work/lerobot`（源码克隆，tag **v0.4.4**）以 editable 方式装的。
+
+> **本环境已强制 `PYTHONNOUSERSITE=1`**（写进
+> `envs/rkvla/etc/conda/activate.d/zz_disable_usersite.sh`）。
+> 只要用 `conda activate rkvla` 激活就自动生效，**不需要手动设**。
+> 这条是本环境能正常工作的前提，不要删。
 
 构造 `SOFollower` 验证通过，`observation_features` 为：
 
@@ -116,6 +129,7 @@ rknnlite          pyrealsense2 2.58.2
 | B3 | `ImportError: libscipy_openblas-9778f98e.so` | rkvla 里的 scipy 装得不完整 | `pip install --force-reinstall --no-cache-dir scipy` |
 | B4 | `OSError: Could not load this library: libtorchaudio.so` | `~/.local` 里的 **torchaudio 2.5.0 要求 torch==2.5.0**，而环境是 torch 2.12.1 → 原生库加载失败；`transformers.is_torchaudio_available()` 只看包在不在，于是硬导 | **`pip uninstall -y torchaudio`**（ACT 根本不需要音频） |
 | B5 | `ModuleNotFoundError: Could not import module 'AutoProcessor'` | 上面 B2/B3/B4 的连锁表现 | 同上 |
+| B6 | `TypeError: non-default argument 'backbone_cfg' follows default argument`，**三个 CLI 全挂** | `~/.local` 的 **transformers 5.12.1 超出 lerobot 0.4.4 的 `transformers<5.0.0` 约束** | 装合规版本进 env + 永久禁用 user-site，详见下节 |
 
 **根源教训**：`lerobot.processor.__init__` 会连带导入 `tokenizer_processor` → `transformers`，
 而 `lerobot.robots.robot` 只是想要两个类型别名。**为一个类型别名拉进整个 transformers 重依赖链**，
@@ -126,6 +140,80 @@ rknnlite          pyrealsense2 2.58.2
 ```bash
 python -c "import transformers; print(transformers.__version__)"
 ```
+
+### B6 详解：transformers 5.x 让整套 CLI 报废
+
+这是本项目**最隐蔽的一个坑**，值得单独记。
+
+**现象**：`lerobot-calibrate` / `lerobot-teleoperate` / `lerobot-record` 全部启动即崩，
+报 `TypeError: non-default argument 'backbone_cfg' follows default argument`。
+
+**报错链**（注意它跟 SO-101 毫无关系）：
+
+```
+lerobot_xxx.py 顶层 eager import 全部机器人类型
+  → lerobot.robots.unitree_g1
+  → lerobot.envs.factory
+  → lerobot.policies.__init__          # 又是 eager import 全部策略
+  → lerobot.policies.groot.groot_n1
+  → @dataclass class GR00TN15Config(PretrainedConfig)
+  → Python 3.10 dataclasses._init_fn → TypeError
+```
+
+**根因**：`groot_n1.py:179` 写的是 `backbone_cfg: dict = field(init=False, ...)`。
+transformers 5.x 把 `PretrainedConfig` 变成了 **kw_only dataclass**
+（`dataclasses.is_dataclass(PretrainedConfig) == True`），
+于是 Python 3.10 在 kw_only 分支上对「无默认值的 kw_only 字段」直接抛错。
+transformers 4.x 下 `PretrainedConfig` 不是 dataclass，因此**只有 5.x 才炸**。
+
+LeRobot 0.4.4 的约束白纸黑字写在 METADATA 里：
+
+```
+Requires-Dist: transformers<5.0.0,>=4.57.1; extra == "transformers-dep"
+Requires-Dist: huggingface-hub[cli,hf-transfer]<0.36.0,>=0.34.2
+```
+
+板子上 `~/.local` 装的是 **5.12.1**，**超出约束**——这个包根本不是给 0.4.4 用的。
+
+**为什么之前查不出来**：`~/.local/lib/python3.10/site-packages` 在 `sys.path` 里
+**排在 conda 环境前面**，所以 `import transformers` 永远拿到 `~/.local` 那份；
+而 env 里**压根没有 transformers**（`PYTHONNOUSERSITE=1` 时是 MISSING）。
+于是"装包"永远修不好——装的都进 env，生效的始终是 `~/.local`。
+
+**修复**（三步，缺一不可）：
+
+```bash
+RK=/home/elf/work/miniconda/envs/rkvla
+export PYTHONNOUSERSITE=1          # 让 env 成为唯一权威
+
+# 1. 装合规版本进 env（必须带 PYTHONNOUSERSITE，否则 pip 会以为 ~/.local 里已满足）
+$RK/bin/python -m pip install --no-cache-dir \
+    "transformers>=4.57.1,<5.0.0" "huggingface-hub>=0.34.2,<0.36.0" \
+    "tokenizers>=0.22.0,<=0.23.0" \
+    "av>=15.0.0,<16.0.0" "datasets>=4.0.0,<5.0.0" \
+    "draccus==0.10.0" "rerun-sdk>=0.24.0,<0.27.0" regex safetensors
+
+# 2. 永久禁用 user-site
+mkdir -p $RK/etc/conda/activate.d
+echo 'export PYTHONNOUSERSITE=1' > $RK/etc/conda/activate.d/zz_disable_usersite.sh
+```
+
+**验证**（三条都该 rc=0）：
+
+```bash
+PYTHONNOUSERSITE=1 $RK/bin/lerobot-calibrate   --help >/dev/null && echo calibrate OK
+PYTHONNOUSERSITE=1 $RK/bin/lerobot-teleoperate --help >/dev/null && echo teleop    OK
+PYTHONNOUSERSITE=1 $RK/bin/lerobot-record      --help >/dev/null && echo record    OK
+```
+
+**一条容易忽略的细节**：`tokenizers` 不能装最新版。transformers 4.57.6 要求
+`<=0.23.0`，直接 `pip install tokenizers` 会拿到 0.23.2 → transformers 导入期报
+`ImportError: tokenizers>=0.22.0,<=0.23.0 is required`。必须锁区间。
+
+**副作用**：pip 输出的 `... but you have X which is incompatible` 大多是**噪音**——
+`torchvision 0.27.1`（要求 `<0.26.0`）、`diffusers 0.40.0`、`setuptools 70.2.0`、
+`deepdiff 9.1.0` 都超约束，但板端只做 RKNN 推理，不碰这些路径。
+真正会阻断的是 `transformers` / `tokenizers` / `av` / `draccus` 这四类。
 
 ## 清理记录
 
